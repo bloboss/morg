@@ -78,6 +78,9 @@ define_keywords! {
     // Structure
     Properties  => "properties",
     End         => "end",
+
+    // Meal planning
+    Meal        => "meal",
 }
 
 // ---------------------------------------------------------------------------

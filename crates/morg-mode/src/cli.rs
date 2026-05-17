@@ -132,6 +132,11 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// List recipes and show meal plan from #meal tags
+    Meals {
+        /// Markdown files or directories to process
+        files: Vec<PathBuf>,
+    },
     /// Move #archive subtrees from source files into archive files
     Archive {
         /// Markdown files or directories to process

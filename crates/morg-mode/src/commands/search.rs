@@ -225,6 +225,7 @@ fn tag_name_str(kind: &TagKind) -> String {
         TagKind::Archive => "archive".to_string(),
         TagKind::Progress => "progress".to_string(),
         TagKind::CustomState { name, .. } => name.to_lowercase(),
+        TagKind::Meal { .. } => "meal".to_string(),
         TagKind::Unknown { name, .. } => name.clone(),
     }
 }

@@ -54,6 +54,11 @@ pub enum TagKind {
     },
     Archive,
     Progress,
+    /// A meal definition or reference for meal planning.
+    Meal {
+        kind: MealKind,
+        date: Option<Timestamp>,
+    },
     /// A custom TODO workflow state defined in frontmatter.
     CustomState {
         name: String,
@@ -151,6 +156,18 @@ pub enum ClockValue {
     },
 }
 
+/// A meal tag — either a recipe definition or a reference to a named recipe.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MealKind {
+    /// `#meal Name [date] | ingredient1, ingredient2, ...`
+    Recipe {
+        name: String,
+        ingredients: Vec<String>,
+    },
+    /// `#meal(name) [date]` — references a named recipe.
+    Reference { name: String },
+}
+
 /// Parse a tag from its name and optional argument.
 ///
 /// Keyword resolution is driven by [`Keyword::from_str`] from `tokens.rs`,
@@ -220,12 +237,79 @@ pub fn parse_tag(name: &str, arg: Option<&str>, span: Span) -> Tag {
         },
         Some(Keyword::Archive) => TagKind::Archive,
         Some(Keyword::Progress) => TagKind::Progress,
+        Some(Keyword::Meal) => match parse_meal(arg) {
+            Some((kind, date)) => TagKind::Meal { kind, date },
+            None => unknown(name, arg),
+        },
         // Properties/End are structural, not inline tags — treat as unknown if used as tags
         Some(Keyword::Properties) | Some(Keyword::End) => unknown(name, arg),
         None => unknown(name, arg),
     };
 
     Tag { kind, span }
+}
+
+/// Parse a meal tag argument into a `(MealKind, Option<Timestamp>)`.
+///
+/// Reference form:  `(name) [date]`  e.g. `(chili)` or `(chili) 2026-05-20`
+/// Definition form: `Name [date] | ingredient1, ingredient2, ...`
+fn parse_meal(arg: Option<&str>) -> Option<(MealKind, Option<Timestamp>)> {
+    let s = arg?.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Reference form: starts with '('
+    if let Some(rest) = s.strip_prefix('(') {
+        let close = rest.find(')')?;
+        let name = rest[..close].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        let after = rest[close + 1..].trim();
+        let date = if after.len() >= 10 {
+            parse_timestamp_full(Some(after)).map(|(ts, _, _)| ts)
+        } else {
+            None
+        };
+        return Some((MealKind::Reference { name }, date));
+    }
+
+    // Definition form: "Name [date] | ingredients"
+    let (head, ingredients_str) = s.split_once('|')?;
+    let head = head.trim();
+    let ingredients: Vec<String> = ingredients_str
+        .split(',')
+        .map(|i| i.trim().to_string())
+        .filter(|i| !i.is_empty())
+        .collect();
+    if ingredients.is_empty() {
+        return None;
+    }
+
+    // head is "Name" or "Name date"
+    // Try to find a date by checking if the last token looks like one
+    let (name, date) = parse_name_and_date(head);
+    if name.is_empty() {
+        return None;
+    }
+
+    Some((MealKind::Recipe { name, ingredients }, date))
+}
+
+/// Split a string like `"Pasta Primavera 2026-05-20"` into `("Pasta Primavera", Some(date))`.
+/// The date, if present, must be the last space-separated token in ISO format.
+fn parse_name_and_date(s: &str) -> (String, Option<Timestamp>) {
+    if let Some(idx) = s.rfind(' ') {
+        let candidate = &s[idx + 1..];
+        if candidate.len() >= 10 {
+            if let Some((ts, _, _)) = parse_timestamp_full(Some(candidate)) {
+                let name = s[..idx].trim().to_string();
+                return (name, Some(ts));
+            }
+        }
+    }
+    (s.to_string(), None)
 }
 
 fn unknown(name: &str, arg: Option<&str>) -> TagKind {
@@ -608,6 +692,57 @@ mod tests {
         assert!(
             matches!(tag.kind, TagKind::Unknown { ref name, ref value } if name == "custom" && value.as_deref() == Some("value"))
         );
+    }
+
+    #[test]
+    fn test_parse_meal_recipe() {
+        let tag = parse_tag(
+            "meal",
+            Some("Chili | beef, beans, tomatoes"),
+            Span::empty(1, 1),
+        );
+        assert!(
+            matches!(&tag.kind, TagKind::Meal { kind: MealKind::Recipe { name, ingredients }, date: None }
+                if name == "Chili" && ingredients == &["beef", "beans", "tomatoes"])
+        );
+    }
+
+    #[test]
+    fn test_parse_meal_recipe_with_date() {
+        let tag = parse_tag(
+            "meal",
+            Some("Pasta 2026-05-20 | pasta, garlic, tomatoes"),
+            Span::empty(1, 1),
+        );
+        assert!(
+            matches!(&tag.kind, TagKind::Meal { kind: MealKind::Recipe { name, .. }, date: Some(_) }
+                if name == "Pasta")
+        );
+    }
+
+    #[test]
+    fn test_parse_meal_reference() {
+        let tag = parse_tag("meal", Some("(chili)"), Span::empty(1, 1));
+        assert!(
+            matches!(&tag.kind, TagKind::Meal { kind: MealKind::Reference { name }, date: None }
+                if name == "chili")
+        );
+    }
+
+    #[test]
+    fn test_parse_meal_reference_with_date() {
+        let tag = parse_tag("meal", Some("(chili) 2026-05-20"), Span::empty(1, 1));
+        assert!(
+            matches!(&tag.kind, TagKind::Meal { kind: MealKind::Reference { name }, date: Some(_) }
+                if name == "chili")
+        );
+    }
+
+    #[test]
+    fn test_parse_meal_no_ingredients_is_unknown() {
+        // Missing | separator should fall back to Unknown
+        let tag = parse_tag("meal", Some("Chili no ingredients here"), Span::empty(1, 1));
+        assert!(matches!(tag.kind, TagKind::Unknown { .. }));
     }
 
     #[test]

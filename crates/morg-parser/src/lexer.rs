@@ -765,8 +765,19 @@ fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<To
     };
 
     let mut arg = String::new();
+
+    // Capture parenthetical immediately after tag name: #meal(chili) or #meal(chili) 2026-05-20
+    if pos < bytes.len() && bytes[pos] == b'(' {
+        if let Some(close_offset) = text[pos..].find(')') {
+            let close_pos = pos + close_offset + 1;
+            arg.push_str(&text[pos..close_pos]);
+            pos = close_pos;
+        }
+    }
+
     if pos < bytes.len() && bytes[pos] == b' ' {
         pos += 1;
+        let space_start = pos;
         while pos < bytes.len() {
             let c = bytes[pos];
             if c == b'#'
@@ -777,16 +788,20 @@ fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<To
             }
             if c == b'\\' {
                 if peek(bytes, pos + 1) == Some(b'#') {
-                    arg.push('#');
                     pos += 2;
                     continue;
                 }
-                arg.push('\\');
                 pos += 1;
                 continue;
             }
-            arg.push(c as char);
             pos += 1;
+        }
+        let space_arg = text[space_start..pos].trim();
+        if !space_arg.is_empty() {
+            if !arg.is_empty() {
+                arg.push(' ');
+            }
+            arg.push_str(space_arg);
         }
     }
 
