@@ -52,6 +52,17 @@ pub enum Command {
         /// Markdown files or directories to process
         files: Vec<PathBuf>,
     },
+    /// List #media items grouped into to-read/watch/listen lists
+    Media {
+        /// Markdown files or directories to process
+        files: Vec<PathBuf>,
+        /// Filter by status: todo, active, or done
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by list: read, watch, listen, play, or other
+        #[arg(long)]
+        category: Option<String>,
+    },
     /// Aggregate YAML frontmatter across files
     Frontmatter {
         /// Markdown files or directories to process
@@ -147,7 +158,7 @@ pub enum Command {
     Watch {
         /// Markdown files or directories to watch
         files: Vec<PathBuf>,
-        /// Command to run on changes (tangle, todos, agenda, time, frontmatter)
+        /// Command to run on changes (tangle, todos, agenda, media, time, frontmatter)
         #[arg(short, long, default_value = "tangle")]
         command: String,
         /// Output directory for tangle command

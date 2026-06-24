@@ -75,6 +75,9 @@ define_keywords! {
     Archive     => "archive",
     Progress    => "progress",
 
+    // Media tracking
+    Media       => "media",
+
     // Structure
     Properties  => "properties",
     End         => "end",

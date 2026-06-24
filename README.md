@@ -8,10 +8,11 @@ morg-mode extends standard markdown with a `#tag` system for metadata, time trac
 
 ## Features
 
-- **Tag system** -- `#todo`, `#deadline`, `#scheduled`, `#clock`, `#priority`, `#effort`, `#archive`, and more. Tags are inline (`text #todo fix this`) or block-level (`#deadline 2026-04-10`).
+- **Tag system** -- `#todo`, `#deadline`, `#scheduled`, `#clock`, `#priority`, `#effort`, `#archive`, `#media`, and more. Tags are inline (`text #todo fix this`) or block-level (`#deadline 2026-04-10`).
 - **Code tangling** -- Extract tagged code blocks into standalone files with `#tangle file=path`. Supports noweb references (`<<block-name>>`), indent preservation, and recursive expansion.
 - **Time tracking** -- `#clock-in`/`#clock-out` pairs and `#clock 1h30m` durations, aggregated into per-heading reports.
 - **Todo management** -- `#todo`/`#done` tags, checkbox lists, custom workflow sequences, priorities, and effort estimates. Aggregated across files.
+- **Media tracking** -- `#media` tags for books, movies, albums, games, and more. Structured fields (creator, status, rating, year) aggregated into to-read/to-watch/to-listen lists.
 - **Agenda** -- Deadlines, scheduled items, and events with recurring timestamps (`+1w`, `+1m`), warning periods (`-3d`), and time-of-day support.
 - **Property drawers** -- Per-heading key-value metadata via `#properties`/`#end` blocks.
 - **Diary** -- Daily note rotation with template stamping, date-based archiving, and automatic todo carry-over.
@@ -92,6 +93,7 @@ Tags are prefixed with `#` (no space -- a space after `#` makes it a heading). E
 | `morg tangle` | Extract code blocks to files |
 | `morg todos` | List TODOs (quickfix-friendly) |
 | `morg agenda` | Chronological deadlines/events |
+| `morg media` | To-read/watch/listen lists from `#media` tags |
 | `morg time` | Time tracking report |
 | `morg search` | Full-text and tag search |
 | `morg lint` | Validate documents |
