@@ -29,6 +29,45 @@ Some text #todo fix this before #deadline 2026-04-15
 
 Use `\#` for a literal hash: `Price is \#100`.
 
+### Purchases
+
+The `#purchase` tag records something to buy or bought. The free-text item name
+is required; `price`, `category`, and `qty` are optional `key=value` attributes
+that may appear in any order, before or after the item name.
+
+```
+#purchase USB-C cable price=12.99 category=cables qty=2
+#purchase HDMI cable price=$8.50 category=cables
+#purchase The Rust Programming Language price=39.99 category=books
+#purchase Notebook
+```
+
+- `price` (alias `cost`) -- amount with an optional leading currency symbol
+  (`$`, `£`, `€`) and up to two decimal places, e.g. `12.99`, `$8.50`, `40`.
+- `category` (alias `cat`) -- a single word used to group entries.
+- `qty` (aliases `quantity`, `count`) -- a positive integer; defaults to `1`.
+
+`morg purchases` aggregates every `#purchase` across your files, grouped by
+category, with per-category subtotals and a grand total (line totals are
+`price × qty`). Like other tags, `#purchase` works inline or block-level and is
+skipped under `#archive` headings.
+
+```
+$ morg purchases
+Purchases
+
+books
+  The Rust Programming Language  $39.99  -- notes.md:6
+  subtotal: $39.99
+
+cables
+  HDMI cable  $8.50  -- notes.md:4
+  USB-C cable x2  $25.98  -- notes.md:3
+  subtotal: $34.48
+
+3 purchase(s), total $74.47
+```
+
 ## Code Blocks
 
 Standard markdown fences with tags and attributes on the info string:

@@ -12,6 +12,7 @@ morg-mode extends standard markdown with a `#tag` system for metadata, time trac
 - **Code tangling** -- Extract tagged code blocks into standalone files with `#tangle file=path`. Supports noweb references (`<<block-name>>`), indent preservation, and recursive expansion.
 - **Time tracking** -- `#clock-in`/`#clock-out` pairs and `#clock 1h30m` durations, aggregated into per-heading reports.
 - **Todo management** -- `#todo`/`#done` tags, checkbox lists, custom workflow sequences, priorities, and effort estimates. Aggregated across files.
+- **Purchase tracking** -- `#purchase` tags with structured `price`, `category`, and `qty` attributes, aggregated into a per-category purchases list with totals.
 - **Agenda** -- Deadlines, scheduled items, and events with recurring timestamps (`+1w`, `+1m`), warning periods (`-3d`), and time-of-day support.
 - **Property drawers** -- Per-heading key-value metadata via `#properties`/`#end` blocks.
 - **Diary** -- Daily note rotation with template stamping, date-based archiving, and automatic todo carry-over.
@@ -92,6 +93,7 @@ Tags are prefixed with `#` (no space -- a space after `#` makes it a heading). E
 | `morg tangle` | Extract code blocks to files |
 | `morg todos` | List TODOs (quickfix-friendly) |
 | `morg agenda` | Chronological deadlines/events |
+| `morg purchases` | Aggregated purchase list with totals |
 | `morg time` | Time tracking report |
 | `morg search` | Full-text and tag search |
 | `morg lint` | Validate documents |

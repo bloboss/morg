@@ -74,6 +74,7 @@ define_keywords! {
     Closed      => "closed",
     Archive     => "archive",
     Progress    => "progress",
+    Purchase    => "purchase",
 
     // Structure
     Properties  => "properties",
