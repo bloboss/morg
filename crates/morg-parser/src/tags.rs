@@ -904,7 +904,9 @@ mod tests {
     fn test_parse_media_full() {
         let tag = parse_tag(
             "media",
-            Some(r#"movie "Blade Runner 2049" director="Denis Villeneuve" status=watched rating=9 year=2017"#),
+            Some(
+                r#"movie "Blade Runner 2049" director="Denis Villeneuve" status=watched rating=9 year=2017"#,
+            ),
             Span::empty(1, 1),
         );
         assert!(matches!(

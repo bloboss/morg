@@ -16,10 +16,9 @@ pub fn run(
         Some(s) => match MediaStatus::parse(s) {
             Some(st) => Some(st),
             None => {
-                return Err(format!(
-                    "unknown --status '{s}' (expected todo, active, or done)"
-                )
-                .into());
+                return Err(
+                    format!("unknown --status '{s}' (expected todo, active, or done)").into(),
+                );
             }
         },
         None => None,
@@ -113,8 +112,7 @@ pub fn run(
 
     let mut first = true;
     for category in MediaCategory::all() {
-        let in_cat: Vec<&MediaEntry> =
-            entries.iter().filter(|e| e.category == *category).collect();
+        let in_cat: Vec<&MediaEntry> = entries.iter().filter(|e| e.category == *category).collect();
         if in_cat.is_empty() {
             continue;
         }
@@ -129,12 +127,18 @@ pub fn run(
     }
 
     let total = entries.len();
-    let todo = entries.iter().filter(|e| e.status == MediaStatus::Todo).count();
+    let todo = entries
+        .iter()
+        .filter(|e| e.status == MediaStatus::Todo)
+        .count();
     let active = entries
         .iter()
         .filter(|e| e.status == MediaStatus::Active)
         .count();
-    let done = entries.iter().filter(|e| e.status == MediaStatus::Done).count();
+    let done = entries
+        .iter()
+        .filter(|e| e.status == MediaStatus::Done)
+        .count();
     println!("\n{todo} queued, {active} in progress, {done} done, {total} total");
 
     Ok(())
@@ -168,14 +172,8 @@ fn format_entry(entry: &MediaEntry) -> String {
         .as_deref()
         .map(|c| format!(" — {c}"))
         .unwrap_or_default();
-    let year = entry
-        .year
-        .map(|y| format!(" ({y})"))
-        .unwrap_or_default();
-    let rating = entry
-        .rating
-        .map(|r| format!(" ★{r}"))
-        .unwrap_or_default();
+    let year = entry.year.map(|y| format!(" ({y})")).unwrap_or_default();
+    let rating = entry.rating.map(|r| format!(" ★{r}")).unwrap_or_default();
     let heading = entry
         .heading
         .as_deref()
