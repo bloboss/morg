@@ -103,6 +103,7 @@ fn run_command(command: &str, paths: &[PathBuf], output_dir: Option<&Path>) {
         "todos" => commands::todos::run(paths, false),
         "agenda" => commands::agenda::run(paths, false),
         "media" => commands::media::run(paths, false, None, None),
+        "purchases" => commands::purchases::run(paths, false),
         "time" => commands::time::run(paths, None),
         "frontmatter" => commands::frontmatter::run(paths),
         other => {

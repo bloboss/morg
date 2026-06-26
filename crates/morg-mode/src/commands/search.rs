@@ -228,6 +228,7 @@ fn tag_name_str(kind: &TagKind) -> String {
             Some(t) => format!("media {kind} {t}"),
             None => format!("media {kind}"),
         },
+        TagKind::Purchase(p) => format!("purchase {}", p.item),
         TagKind::CustomState { name, .. } => name.to_lowercase(),
         TagKind::Unknown { name, .. } => name.clone(),
     }

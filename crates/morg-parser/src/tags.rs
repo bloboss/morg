@@ -63,6 +63,8 @@ pub enum TagKind {
         rating: Option<u8>,
         year: Option<i32>,
     },
+    /// A tracked purchase, e.g. `#purchase USB-C cable price=12.99 category=cables`.
+    Purchase(PurchaseValue),
     /// A custom TODO workflow state defined in frontmatter.
     CustomState {
         name: String,
@@ -314,6 +316,55 @@ impl MediaStatus {
 impl std::fmt::Display for MediaStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+      
+    }
+}
+/// Structured value for a `#purchase` tag.
+///
+/// The free-text item name is required; price, category, and quantity are
+/// optional `key=value` attributes that may appear in any order:
+/// `#purchase USB-C cable price=12.99 category=cables qty=2`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PurchaseValue {
+    /// What was (or is to be) purchased.
+    pub item: String,
+    /// Unit price, if given.
+    pub price: Option<Money>,
+    /// Free-form category for grouping (e.g. `books`, `cables`).
+    pub category: Option<String>,
+    /// Number of units. Defaults to 1.
+    pub quantity: u32,
+}
+
+impl PurchaseValue {
+    /// Total cost in cents (`price * quantity`), if a price was given.
+    pub fn total_cents(&self) -> Option<u64> {
+        self.price.map(|p| p.cents * self.quantity as u64)
+    }
+}
+
+/// A monetary amount stored as integer cents to avoid floating-point drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Money {
+    /// Optional currency symbol (`$`, `£`, `€`).
+    pub currency: Option<char>,
+    /// Amount in the smallest unit (cents).
+    pub cents: u64,
+}
+
+impl Money {
+    /// Format `cents` as a decimal amount, prefixed with `symbol` when given.
+    pub fn format_with(symbol: Option<char>, cents: u64) -> String {
+        match symbol {
+            Some(c) => format!("{c}{}.{:02}", cents / 100, cents % 100),
+            None => format!("{}.{:02}", cents / 100, cents % 100),
+        }
+    }
+}
+
+impl std::fmt::Display for Money {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&Money::format_with(self.currency, self.cents))
     }
 }
 
@@ -388,6 +439,8 @@ pub fn parse_tag(name: &str, arg: Option<&str>, span: Span) -> Tag {
         Some(Keyword::Progress) => TagKind::Progress,
         Some(Keyword::Media) => match parse_media(arg) {
             Some(kind) => kind,
+        Some(Keyword::Purchase) => match parse_purchase(arg) {
+            Some(value) => TagKind::Purchase(value),
             None => unknown(name, arg),
         },
         // Properties/End are structural, not inline tags — treat as unknown if used as tags
@@ -675,6 +728,107 @@ fn parse_clock(arg: Option<&str>) -> Option<ClockValue> {
     parse_duration(s).map(|minutes| ClockValue::Duration { minutes })
 }
 
+/// Parse a `#purchase` argument into structured fields.
+///
+/// Tokens of the form `key=value` with a recognized key (`price`/`cost`,
+/// `category`/`cat`, `qty`/`quantity`/`count`) are consumed as attributes;
+/// everything else joins to form the item name. Returns `None` if no item
+/// name remains.
+fn parse_purchase(arg: Option<&str>) -> Option<PurchaseValue> {
+    let s = arg?.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let mut item_parts: Vec<&str> = Vec::new();
+    let mut price = None;
+    let mut category = None;
+    let mut quantity: u32 = 1;
+
+    for token in s.split_whitespace() {
+        if let Some((key, value)) = token.split_once('=')
+            && !value.is_empty()
+        {
+            match key.to_ascii_lowercase().as_str() {
+                "price" | "cost" => {
+                    if let Some(money) = parse_money(value) {
+                        price = Some(money);
+                        continue;
+                    }
+                }
+                "category" | "cat" => {
+                    category = Some(value.to_string());
+                    continue;
+                }
+                "qty" | "quantity" | "count" => {
+                    if let Ok(q) = value.parse::<u32>()
+                        && q > 0
+                    {
+                        quantity = q;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
+        item_parts.push(token);
+    }
+
+    let item = item_parts.join(" ");
+    if item.is_empty() {
+        return None;
+    }
+
+    Some(PurchaseValue {
+        item,
+        price,
+        category,
+        quantity,
+    })
+}
+
+/// Parse a monetary amount with an optional leading currency symbol.
+/// Accepts `12.99`, `$12.99`, `£8`, `40`, `9.5`.
+fn parse_money(s: &str) -> Option<Money> {
+    let s = s.trim();
+    let (currency, rest) = match s.chars().next() {
+        Some(c @ ('$' | '£' | '€')) => (Some(c), &s[c.len_utf8()..]),
+        _ => (None, s),
+    };
+    let cents = parse_cents(rest.trim())?;
+    Some(Money { currency, cents })
+}
+
+/// Parse a decimal amount (up to two fractional digits) into integer cents.
+fn parse_cents(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    match s.split_once('.') {
+        Some((whole, frac)) => {
+            if frac.is_empty() || frac.len() > 2 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let whole: u64 = if whole.is_empty() {
+                0
+            } else {
+                whole.parse().ok()?
+            };
+            let frac_value: u64 = frac.parse().ok()?;
+            let cents = if frac.len() == 1 {
+                frac_value * 10
+            } else {
+                frac_value
+            };
+            Some(whole * 100 + cents)
+        }
+        None => {
+            let whole: u64 = s.parse().ok()?;
+            Some(whole * 100)
+        }
+    }
+}
+
 fn parse_priority(arg: Option<&str>) -> Option<PriorityLevel> {
     let s = arg?.trim();
     match s {
@@ -907,9 +1061,9 @@ mod tests {
             Some(
                 r#"movie "Blade Runner 2049" director="Denis Villeneuve" status=watched rating=9 year=2017"#,
             ),
-            Span::empty(1, 1),
-        );
-        assert!(matches!(
+            Span::empty(1,1),
+       );
+       assert!(matches!(
             tag.kind,
             TagKind::Media {
                 kind: MediaKind::Movie,
@@ -920,6 +1074,44 @@ mod tests {
                 year: Some(2017),
             } if title.as_deref() == Some("Blade Runner 2049")
                 && creator.as_deref() == Some("Denis Villeneuve")
+        ));
+    };
+          
+    fn test_parse_purchase_full() {
+        let tag = parse_tag(
+            "purchase",
+            Some("USB-C cable price=12.99 category=cables qty=2"),
+            Span::empty(1, 1),
+        );
+        match tag.kind {
+            TagKind::Purchase(p) => {
+                assert_eq!(p.item, "USB-C cable");
+                assert_eq!(p.category.as_deref(), Some("cables"));
+                assert_eq!(p.quantity, 2);
+                let money = p.price.unwrap();
+                assert_eq!(money.cents, 1299);
+                assert_eq!(money.currency, None);
+                assert_eq!(p.total_cents(), Some(2598));
+            }
+            other => panic!("expected purchase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_purchase_item_only() {
+        let tag = parse_tag(
+            "purchase",
+            Some("The Rust Programming Language"),
+            Span::empty(1, 1),
+        );
+        assert!(matches!(
+            tag.kind,
+            TagKind::Purchase(PurchaseValue {
+                ref item,
+                price: None,
+                category: None,
+                quantity: 1,
+            }) if item == "The Rust Programming Language"
         ));
     }
 
@@ -959,6 +1151,81 @@ mod tests {
     fn test_parse_media_empty_falls_back() {
         let tag = parse_tag("media", None, Span::empty(1, 1));
         assert!(matches!(tag.kind, TagKind::Unknown { ref name, .. } if name == "media"));
+    }
+  
+    fn test_parse_purchase_currency_symbol() {
+        let tag = parse_tag(
+            "purchase",
+            Some("HDMI cable price=$8.50"),
+            Span::empty(1, 1),
+        );
+        match tag.kind {
+            TagKind::Purchase(p) => {
+                let money = p.price.unwrap();
+                assert_eq!(money.cents, 850);
+                assert_eq!(money.currency, Some('$'));
+                assert_eq!(money.to_string(), "$8.50");
+            }
+            other => panic!("expected purchase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_purchase_attributes_any_order() {
+        let tag = parse_tag(
+            "purchase",
+            Some("category=books price=40 Some Book"),
+            Span::empty(1, 1),
+        );
+        match tag.kind {
+            TagKind::Purchase(p) => {
+                assert_eq!(p.item, "Some Book");
+                assert_eq!(p.category.as_deref(), Some("books"));
+                assert_eq!(p.price.unwrap().cents, 4000);
+            }
+            other => panic!("expected purchase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_purchase_empty_falls_back() {
+        let tag = parse_tag("purchase", None, Span::empty(1, 1));
+        assert!(matches!(tag.kind, TagKind::Unknown { ref name, .. } if name == "purchase"));
+    }
+
+    #[test]
+    fn test_money_parsing() {
+        assert_eq!(
+            parse_money("12.99"),
+            Some(Money {
+                currency: None,
+                cents: 1299
+            })
+        );
+        assert_eq!(
+            parse_money("40"),
+            Some(Money {
+                currency: None,
+                cents: 4000
+            })
+        );
+        assert_eq!(
+            parse_money("9.5"),
+            Some(Money {
+                currency: None,
+                cents: 950
+            })
+        );
+        assert_eq!(
+            parse_money("$8.50"),
+            Some(Money {
+                currency: Some('$'),
+                cents: 850
+            })
+        );
+        assert_eq!(parse_money("abc"), None);
+        assert_eq!(parse_money("1.999"), None);
+        assert_eq!(parse_money(""), None);
     }
 
     #[test]

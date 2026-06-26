@@ -63,6 +63,11 @@ pub enum Command {
         #[arg(long)]
         category: Option<String>,
     },
+    /// List #purchase entries, grouped by category with totals
+    Purchases {
+        /// Markdown files or directories to process
+        files: Vec<PathBuf>,
+    },
     /// Aggregate YAML frontmatter across files
     Frontmatter {
         /// Markdown files or directories to process
@@ -158,7 +163,8 @@ pub enum Command {
     Watch {
         /// Markdown files or directories to watch
         files: Vec<PathBuf>,
-        /// Command to run on changes (tangle, todos, agenda, media, time, frontmatter)
+        /// Command to run on changes (tangle, todos, agenda, media
+        /// purchases, time, frontmatter)
         #[arg(short, long, default_value = "tangle")]
         command: String,
         /// Output directory for tangle command
