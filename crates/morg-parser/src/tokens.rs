@@ -76,6 +76,9 @@ define_keywords! {
     Progress    => "progress",
     Purchase    => "purchase",
 
+    // Media tracking
+    Media       => "media",
+
     // Structure
     Properties  => "properties",
     End         => "end",

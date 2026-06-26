@@ -29,7 +29,48 @@ Some text #todo fix this before #deadline 2026-04-15
 
 Use `\#` for a literal hash: `Price is \#100`.
 
-### Purchases
+## Media
+
+The `#media` tag records books, movies, music, games, and similar items so
+they can be aggregated into to-read / to-watch / to-listen lists with
+`morg media`.
+
+```
+#media book The Hobbit by="J.R.R. Tolkien" status=to-read
+#media movie "Blade Runner 2049" director="Denis Villeneuve" status=watched rating=9 year=2017
+#media album "OK Computer" by=Radiohead status=to-listen
+#media game Hades status=playing
+```
+
+The argument is `<kind> <title…> [key=value …]`:
+
+- **kind** -- the first word selects the medium and which list the item lands
+  on:
+  - *To Read* -- `book`, `article`, `comic`, `manga`
+  - *To Watch* -- `movie`, `film`, `show`, `tv`, `series`, `anime`
+  - *To Listen* -- `album`, `music`, `podcast`, `song`
+  - *To Play* -- `game`
+  - any other word is kept verbatim and grouped under *Other*.
+- **title** -- the remaining bare words. Wrap multi-word values in double
+  quotes to keep them intact (`"Blade Runner 2049"`).
+- **attributes** (`key=value`):
+  - `by` / `author` / `director` / `artist` / `creator`
+  - `status` / `state` -- `todo` (default), `active`, or `done`. Synonyms are
+    accepted: `to-read`/`want`/`queued` → todo, `reading`/`watching`/`playing`
+    → active, `read`/`watched`/`finished` → done.
+  - `rating` / `score` -- a number
+  - `year` -- release year
+
+List and filter items with:
+
+```sh
+morg media                      # grouped to-read/watch/listen lists
+morg media --status todo        # only items you haven't started
+morg media --category watch     # only the to-watch list
+morg media --format json        # machine-readable
+```
+
+## Purchases
 
 The `#purchase` tag records something to buy or bought. The free-text item name
 is required; `price`, `category`, and `qty` are optional `key=value` attributes

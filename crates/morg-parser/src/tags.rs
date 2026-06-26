@@ -54,6 +54,15 @@ pub enum TagKind {
     },
     Archive,
     Progress,
+    /// A media item (book, movie, album, …) for "to read/watch/listen" lists.
+    Media {
+        kind: MediaKind,
+        title: Option<String>,
+        creator: Option<String>,
+        status: MediaStatus,
+        rating: Option<u8>,
+        year: Option<i32>,
+    },
     /// A tracked purchase, e.g. `#purchase USB-C cable price=12.99 category=cables`.
     Purchase(PurchaseValue),
     /// A custom TODO workflow state defined in frontmatter.
@@ -153,6 +162,162 @@ pub enum ClockValue {
     },
 }
 
+/// The medium of a `#media` item. Determines which aggregated list it lands on.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MediaKind {
+    Book,
+    Article,
+    Comic,
+    Manga,
+    Movie,
+    Show,
+    Anime,
+    Album,
+    Podcast,
+    Song,
+    Game,
+    /// Any unrecognized medium, preserving the word the user wrote.
+    Other(String),
+}
+
+impl MediaKind {
+    /// Parse a medium word. Unknown words become [`MediaKind::Other`].
+    pub fn parse(s: &str) -> MediaKind {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "book" | "books" | "novel" | "ebook" | "audiobook" => MediaKind::Book,
+            "article" | "paper" | "essay" | "blog" | "post" => MediaKind::Article,
+            "comic" | "comics" | "graphicnovel" => MediaKind::Comic,
+            "manga" => MediaKind::Manga,
+            "movie" | "film" => MediaKind::Movie,
+            "show" | "tv" | "series" => MediaKind::Show,
+            "anime" => MediaKind::Anime,
+            "album" | "music" | "record" => MediaKind::Album,
+            "podcast" => MediaKind::Podcast,
+            "song" | "track" | "single" => MediaKind::Song,
+            "game" | "videogame" => MediaKind::Game,
+            other => MediaKind::Other(other.to_string()),
+        }
+    }
+
+    /// The canonical word for this medium.
+    pub fn as_str(&self) -> &str {
+        match self {
+            MediaKind::Book => "book",
+            MediaKind::Article => "article",
+            MediaKind::Comic => "comic",
+            MediaKind::Manga => "manga",
+            MediaKind::Movie => "movie",
+            MediaKind::Show => "show",
+            MediaKind::Anime => "anime",
+            MediaKind::Album => "album",
+            MediaKind::Podcast => "podcast",
+            MediaKind::Song => "song",
+            MediaKind::Game => "game",
+            MediaKind::Other(s) => s,
+        }
+    }
+
+    /// Which aggregated list this medium belongs to.
+    pub fn category(&self) -> MediaCategory {
+        match self {
+            MediaKind::Book | MediaKind::Article | MediaKind::Comic | MediaKind::Manga => {
+                MediaCategory::Read
+            }
+            MediaKind::Movie | MediaKind::Show | MediaKind::Anime => MediaCategory::Watch,
+            MediaKind::Album | MediaKind::Podcast | MediaKind::Song => MediaCategory::Listen,
+            MediaKind::Game => MediaCategory::Play,
+            MediaKind::Other(_) => MediaCategory::Other,
+        }
+    }
+}
+
+impl std::fmt::Display for MediaKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The aggregated list a media item belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MediaCategory {
+    Read,
+    Watch,
+    Listen,
+    Play,
+    Other,
+}
+
+impl MediaCategory {
+    /// Human-readable heading for this list, e.g. "To Read".
+    pub fn label(&self) -> &'static str {
+        match self {
+            MediaCategory::Read => "To Read",
+            MediaCategory::Watch => "To Watch",
+            MediaCategory::Listen => "To Listen",
+            MediaCategory::Play => "To Play",
+            MediaCategory::Other => "Other",
+        }
+    }
+
+    /// Categories in display order.
+    pub fn all() -> &'static [MediaCategory] {
+        &[
+            MediaCategory::Read,
+            MediaCategory::Watch,
+            MediaCategory::Listen,
+            MediaCategory::Play,
+            MediaCategory::Other,
+        ]
+    }
+}
+
+/// Where a media item sits in the consume-it lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MediaStatus {
+    /// Want to consume it (the default): on the "to read/watch/listen" list.
+    Todo,
+    /// Currently consuming it.
+    Active,
+    /// Finished with it.
+    Done,
+}
+
+impl MediaStatus {
+    /// Parse a status word, accepting medium-specific synonyms. Returns `None`
+    /// for unrecognized words so callers can fall back to the default.
+    pub fn parse(s: &str) -> Option<MediaStatus> {
+        let normalized: String = s
+            .trim()
+            .to_ascii_lowercase()
+            .chars()
+            .filter(|c| !matches!(c, '-' | '_' | ' '))
+            .collect();
+        match normalized.as_str() {
+            "todo" | "want" | "queued" | "queue" | "backlog" | "planned" | "wishlist"
+            | "toread" | "towatch" | "tolisten" | "toplay" | "unread" => Some(MediaStatus::Todo),
+            "doing" | "active" | "inprogress" | "current" | "reading" | "watching"
+            | "listening" | "playing" => Some(MediaStatus::Active),
+            "done" | "read" | "watched" | "listened" | "played" | "finished" | "complete"
+            | "completed" => Some(MediaStatus::Done),
+            _ => None,
+        }
+    }
+
+    /// The canonical word for this status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MediaStatus::Todo => "todo",
+            MediaStatus::Active => "active",
+            MediaStatus::Done => "done",
+        }
+    }
+}
+
+impl std::fmt::Display for MediaStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 /// Structured value for a `#purchase` tag.
 ///
 /// The free-text item name is required; price, category, and quantity are
@@ -271,6 +436,10 @@ pub fn parse_tag(name: &str, arg: Option<&str>, span: Span) -> Tag {
         },
         Some(Keyword::Archive) => TagKind::Archive,
         Some(Keyword::Progress) => TagKind::Progress,
+        Some(Keyword::Media) => match parse_media(arg) {
+            Some(kind) => kind,
+            None => unknown(name, arg),
+        },
         Some(Keyword::Purchase) => match parse_purchase(arg) {
             Some(value) => TagKind::Purchase(value),
             None => unknown(name, arg),
@@ -431,6 +600,108 @@ fn parse_event(arg: Option<&str>) -> Option<(Timestamp, Option<Repeater>, Option
         Some(description_part.to_string())
     };
     Some((ts, repeater, description))
+}
+
+/// Parse a `#media` argument into a structured media item.
+///
+/// Syntax: `<kind> <title…> [key=value …]`
+///   - The first bare word is the medium (`book`, `movie`, `album`, …).
+///   - Remaining bare words form the title. Wrap multi-word values in
+///     double quotes to keep them together (`director="Denis Villeneuve"`).
+///   - Recognized attributes: `by`/`author`/`director`/`artist`/`creator`,
+///     `status`/`state`, `rating`/`score`, `year`.
+///
+/// Returns `None` when there is no medium word, so the caller falls back to
+/// treating it as an unknown tag.
+fn parse_media(arg: Option<&str>) -> Option<TagKind> {
+    let s = arg?.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let mut kind: Option<MediaKind> = None;
+    let mut title_parts: Vec<String> = Vec::new();
+    let mut creator: Option<String> = None;
+    let mut status: Option<MediaStatus> = None;
+    let mut rating: Option<u8> = None;
+    let mut year: Option<i32> = None;
+
+    for token in split_media_args(s) {
+        if let Some((key, value)) = token.split_once('=') {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            match key.trim().to_ascii_lowercase().as_str() {
+                "by" | "author" | "director" | "artist" | "creator" => {
+                    creator = Some(value.to_string());
+                }
+                "status" | "state" => {
+                    status = MediaStatus::parse(value);
+                }
+                "rating" | "score" => {
+                    rating = value.parse().ok();
+                }
+                "year" => {
+                    year = value.parse().ok();
+                }
+                // Unknown attributes are ignored rather than polluting the title.
+                _ => {}
+            }
+        } else if kind.is_none() {
+            kind = Some(MediaKind::parse(&token));
+        } else {
+            title_parts.push(token);
+        }
+    }
+
+    let kind = kind?;
+    let title = if title_parts.is_empty() {
+        None
+    } else {
+        Some(title_parts.join(" "))
+    };
+
+    Some(TagKind::Media {
+        kind,
+        title,
+        creator,
+        status: status.unwrap_or(MediaStatus::Todo),
+        rating,
+        year,
+    })
+}
+
+/// Split a media argument into whitespace-separated tokens, keeping
+/// double-quoted spans (and `key="quoted value"` attributes) intact.
+fn split_media_args(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_content = false;
+
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_content = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_content {
+                    tokens.push(std::mem::take(&mut current));
+                    has_content = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_content = true;
+            }
+        }
+    }
+    if has_content {
+        tokens.push(current);
+    }
+    tokens
 }
 
 fn parse_datetime(arg: Option<&str>) -> Option<NaiveDateTime> {
@@ -759,6 +1030,55 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_media_book() {
+        let tag = parse_tag("media", Some("book The Hobbit"), Span::empty(1, 1));
+        assert!(matches!(
+            tag.kind,
+            TagKind::Media {
+                kind: MediaKind::Book,
+                ref title,
+                status: MediaStatus::Todo,
+                ..
+            } if title.as_deref() == Some("The Hobbit")
+        ));
+    }
+
+    #[test]
+    fn test_parse_media_category() {
+        assert_eq!(MediaKind::Book.category(), MediaCategory::Read);
+        assert_eq!(MediaKind::Movie.category(), MediaCategory::Watch);
+        assert_eq!(MediaKind::Album.category(), MediaCategory::Listen);
+        assert_eq!(MediaKind::Game.category(), MediaCategory::Play);
+        assert_eq!(
+            MediaKind::parse("boardgame").category(),
+            MediaCategory::Other
+        );
+    }
+
+    #[test]
+    fn test_parse_media_full() {
+        let tag = parse_tag(
+            "media",
+            Some(
+                r#"movie "Blade Runner 2049" director="Denis Villeneuve" status=watched rating=9 year=2017"#,
+            ),
+            Span::empty(1, 1),
+        );
+        assert!(matches!(
+            tag.kind,
+            TagKind::Media {
+                kind: MediaKind::Movie,
+                ref title,
+                ref creator,
+                status: MediaStatus::Done,
+                rating: Some(9),
+                year: Some(2017),
+            } if title.as_deref() == Some("Blade Runner 2049")
+                && creator.as_deref() == Some("Denis Villeneuve")
+        ));
+    }
+
+    #[test]
     fn test_parse_purchase_full() {
         let tag = parse_tag(
             "purchase",
@@ -798,6 +1118,43 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_media_status_synonyms() {
+        let tag = parse_tag("media", Some("book Dune status=reading"), Span::empty(1, 1));
+        assert!(matches!(
+            tag.kind,
+            TagKind::Media {
+                status: MediaStatus::Active,
+                ..
+            }
+        ));
+
+        let tag = parse_tag("media", Some("album OK by=Radiohead"), Span::empty(1, 1));
+        assert!(matches!(
+            tag.kind,
+            TagKind::Media {
+                kind: MediaKind::Album,
+                status: MediaStatus::Todo,
+                ref creator,
+                ..
+            } if creator.as_deref() == Some("Radiohead")
+        ));
+    }
+
+    #[test]
+    fn test_parse_media_unknown_kind_preserved() {
+        let tag = parse_tag("media", Some("boardgame Catan"), Span::empty(1, 1));
+        assert!(matches!(
+            tag.kind,
+            TagKind::Media { kind: MediaKind::Other(ref k), .. } if k == "boardgame"
+        ));
+    }
+
+    #[test]
+    fn test_parse_media_empty_falls_back() {
+        let tag = parse_tag("media", None, Span::empty(1, 1));
+        assert!(matches!(tag.kind, TagKind::Unknown { ref name, .. } if name == "media"));
+    }
+
     fn test_parse_purchase_currency_symbol() {
         let tag = parse_tag(
             "purchase",

@@ -35,6 +35,16 @@ fn main() {
         }
         Command::Todos { files } => commands::todos::run(&default_files(files), json),
         Command::Agenda { files } => commands::agenda::run(&default_files(files), json),
+        Command::Media {
+            files,
+            status,
+            category,
+        } => commands::media::run(
+            &default_files(files),
+            json,
+            status.as_deref(),
+            category.as_deref(),
+        ),
         Command::Purchases { files } => commands::purchases::run(&default_files(files), json),
         Command::Frontmatter { files } => commands::frontmatter::run(&default_files(files)),
         Command::Ical { files, output } => {
