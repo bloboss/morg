@@ -224,6 +224,7 @@ fn tag_name_str(kind: &TagKind) -> String {
         TagKind::Closed { .. } => "closed".to_string(),
         TagKind::Archive => "archive".to_string(),
         TagKind::Progress => "progress".to_string(),
+        TagKind::Purchase(p) => format!("purchase {}", p.item),
         TagKind::CustomState { name, .. } => name.to_lowercase(),
         TagKind::Unknown { name, .. } => name.clone(),
     }

@@ -8,6 +8,7 @@ pub mod frontmatter;
 pub mod ical;
 pub mod id;
 pub mod lint;
+pub mod purchases;
 pub mod refile;
 pub mod refs;
 pub mod search;
