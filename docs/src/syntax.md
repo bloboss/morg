@@ -68,7 +68,9 @@ morg media                      # grouped to-read/watch/listen lists
 morg media --status todo        # only items you haven't started
 morg media --category watch     # only the to-watch list
 morg media --format json        # machine-readable
-### Purchases
+```
+
+## Purchases
 
 The `#purchase` tag records something to buy or bought. The free-text item name
 is required; `price`, `category`, and `qty` are optional `key=value` attributes

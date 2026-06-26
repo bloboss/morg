@@ -163,8 +163,7 @@ pub enum Command {
     Watch {
         /// Markdown files or directories to watch
         files: Vec<PathBuf>,
-        /// Command to run on changes (tangle, todos, agenda, media
-        /// purchases, time, frontmatter)
+        /// Command to run on changes (tangle, todos, agenda, media, purchases, time, frontmatter)
         #[arg(short, long, default_value = "tangle")]
         command: String,
         /// Output directory for tangle command

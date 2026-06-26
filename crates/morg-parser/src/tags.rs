@@ -316,7 +316,6 @@ impl MediaStatus {
 impl std::fmt::Display for MediaStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
-      
     }
 }
 /// Structured value for a `#purchase` tag.
@@ -439,6 +438,8 @@ pub fn parse_tag(name: &str, arg: Option<&str>, span: Span) -> Tag {
         Some(Keyword::Progress) => TagKind::Progress,
         Some(Keyword::Media) => match parse_media(arg) {
             Some(kind) => kind,
+            None => unknown(name, arg),
+        },
         Some(Keyword::Purchase) => match parse_purchase(arg) {
             Some(value) => TagKind::Purchase(value),
             None => unknown(name, arg),
@@ -1061,9 +1062,9 @@ mod tests {
             Some(
                 r#"movie "Blade Runner 2049" director="Denis Villeneuve" status=watched rating=9 year=2017"#,
             ),
-            Span::empty(1,1),
-       );
-       assert!(matches!(
+            Span::empty(1, 1),
+        );
+        assert!(matches!(
             tag.kind,
             TagKind::Media {
                 kind: MediaKind::Movie,
@@ -1075,8 +1076,9 @@ mod tests {
             } if title.as_deref() == Some("Blade Runner 2049")
                 && creator.as_deref() == Some("Denis Villeneuve")
         ));
-    };
-          
+    }
+
+    #[test]
     fn test_parse_purchase_full() {
         let tag = parse_tag(
             "purchase",
@@ -1152,7 +1154,7 @@ mod tests {
         let tag = parse_tag("media", None, Span::empty(1, 1));
         assert!(matches!(tag.kind, TagKind::Unknown { ref name, .. } if name == "media"));
     }
-  
+
     fn test_parse_purchase_currency_symbol() {
         let tag = parse_tag(
             "purchase",
