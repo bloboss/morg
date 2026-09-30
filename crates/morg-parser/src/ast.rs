@@ -140,9 +140,12 @@ pub struct InlineContent {
 }
 
 impl InlineContent {
-    pub fn plain(text: &str) -> Self {
+    pub fn plain(text: &str, span: Span) -> Self {
         Self {
-            segments: vec![InlineSegment::Text(text.to_string())],
+            segments: vec![InlineSegment {
+                kind: InlineKind::Text(text.to_string()),
+                span,
+            }],
         }
     }
 
@@ -168,17 +171,17 @@ impl InlineContent {
 
 fn plain_text_segments(segments: &[InlineSegment], out: &mut String) {
     for seg in segments {
-        match seg {
-            InlineSegment::Text(t) => out.push_str(t),
-            InlineSegment::Code(c) => out.push_str(c),
-            InlineSegment::Tag(_) => {}
-            InlineSegment::Bold(inner)
-            | InlineSegment::Italic(inner)
-            | InlineSegment::Strikethrough(inner) => {
+        match &seg.kind {
+            InlineKind::Text(t) => out.push_str(t),
+            InlineKind::Code(c) => out.push_str(c),
+            InlineKind::Tag(_) => {}
+            InlineKind::Bold(inner)
+            | InlineKind::Italic(inner)
+            | InlineKind::Strikethrough(inner) => {
                 plain_text_segments(&inner.segments, out);
             }
-            InlineSegment::Link(link) => out.push_str(&link.text),
-            InlineSegment::FootnoteRef(label) => {
+            InlineKind::Link(link) => out.push_str(&link.text),
+            InlineKind::FootnoteRef(label) => {
                 out.push_str("[^");
                 out.push_str(label);
                 out.push(']');
@@ -189,25 +192,45 @@ fn plain_text_segments(segments: &[InlineSegment], out: &mut String) {
 
 fn collect_tags_from_segments<'a>(segments: &'a [InlineSegment], out: &mut Vec<&'a Tag>) {
     for seg in segments {
-        match seg {
-            InlineSegment::Tag(t) => out.push(t),
-            InlineSegment::Bold(inner)
-            | InlineSegment::Italic(inner)
-            | InlineSegment::Strikethrough(inner) => {
+        match &seg.kind {
+            InlineKind::Tag(t) => out.push(t),
+            InlineKind::Bold(inner)
+            | InlineKind::Italic(inner)
+            | InlineKind::Strikethrough(inner) => {
                 collect_tags_from_segments(&inner.segments, out);
             }
-            InlineSegment::Link(link) => {
+            InlineKind::Link(link) => {
                 for t in &link.tags {
                     out.push(t);
                 }
             }
-            InlineSegment::Text(_) | InlineSegment::Code(_) | InlineSegment::FootnoteRef(_) => {}
+            InlineKind::Text(_) | InlineKind::Code(_) | InlineKind::FootnoteRef(_) => {}
         }
     }
 }
 
+/// A single piece of inline content together with its source location.
+///
+/// `span.start`/`span.end` are **byte offsets absolute within the source
+/// file** passed to [`crate::parse_document`], so
+/// `&source[seg.span.start..seg.span.end]` yields exactly the source text of
+/// the segment (including its markup, e.g. `**bold**` or `` `code` ``).
+/// `span.line` is 1-based; `span.col` is a 1-based *byte* column within that
+/// line, matching block-level spans. Use [`crate::line_index::LineIndex`] to
+/// convert offsets to UTF-8/UTF-16 columns.
+///
+/// Exception: content nested inside a callout body is re-parsed from a
+/// reassembled buffer, so its offsets are relative to that buffer — the same
+/// (pre-existing) convention as block spans inside callouts.
 #[derive(Debug, Clone, PartialEq)]
-pub enum InlineSegment {
+pub struct InlineSegment {
+    pub kind: InlineKind,
+    pub span: Span,
+}
+
+/// The kind of an [`InlineSegment`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum InlineKind {
     Text(String),
     Tag(Tag),
     Bold(InlineContent),

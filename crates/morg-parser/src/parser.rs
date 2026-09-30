@@ -132,7 +132,7 @@ fn parse_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Option<Bloc
             let span = lex.advance().span;
             skip_newline(lex);
             Some(Block::Paragraph(Paragraph {
-                content: InlineContent::plain("---"),
+                content: InlineContent::plain("---", span),
                 span,
             }))
         }
@@ -166,7 +166,7 @@ fn parse_heading(lex: &mut Lexer<'_>, level: u8, errors: &mut Vec<ParseError>) -
     let text = raw.trim_start();
     let content_start = text.find(' ').map(|i| i + 1).unwrap_or(text.len());
     let content_text = &text[content_start..];
-    let content = build_inline_content(content_text, head_span);
+    let content = build_inline_content(content_text, sub_span(head_span, &raw, content_text));
 
     // Look ahead for property drawer
     let saved = lex.position();
@@ -439,12 +439,18 @@ fn parse_list(lex: &mut Lexer<'_>) -> Block {
 
         let (checkbox, content_text) = parse_list_item_content(&raw);
         let (term_text, desc) = if let Some((term, desc_text)) = content_text.split_once(" :: ") {
-            (term, Some(build_inline_content(desc_text, item_span)))
+            (
+                term,
+                Some(build_inline_content(
+                    desc_text,
+                    sub_span(item_span, &raw, desc_text),
+                )),
+            )
         } else {
             (content_text, None)
         };
 
-        let content = build_inline_content(term_text, item_span);
+        let content = build_inline_content(term_text, sub_span(item_span, &raw, term_text));
 
         flat_items.push(ListItem {
             checkbox,
@@ -598,7 +604,10 @@ fn parse_table_row_content(line: &str, span: Span) -> Vec<InlineContent> {
     let inner = inner.strip_suffix('|').unwrap_or(inner);
     inner
         .split('|')
-        .map(|cell| build_inline_content(cell.trim(), span))
+        .map(|cell| {
+            let cell = cell.trim();
+            build_inline_content(cell, sub_span(span, line, cell))
+        })
         .collect()
 }
 
@@ -780,8 +789,12 @@ fn parse_footnote_def(lex: &mut Lexer<'_>) -> Block {
     skip_newline(lex);
 
     let prefix = format!("[^{label}]: ");
-    let content_text = raw.trim().strip_prefix(&prefix).unwrap_or("");
-    let content = build_inline_content(content_text, span);
+    let content = match raw.trim().strip_prefix(&prefix) {
+        Some(content_text) => {
+            build_inline_content(content_text, sub_span(span, &raw, content_text))
+        }
+        None => InlineContent::empty(),
+    };
 
     Block::FootnoteDefinition(FootnoteDefinition {
         label,
@@ -858,45 +871,95 @@ fn parse_paragraph(lex: &mut Lexer<'_>) -> Option<Block> {
 // Inline content builder (uses lexer::tokenize_inline)
 // ---------------------------------------------------------------------------
 
-fn build_inline_content(text: &str, span: Span) -> InlineContent {
-    let tokens = lexer::tokenize_inline(text, span);
-    tokens_to_inline_content(&tokens, span)
+/// Span for a subslice `sub` of a line's raw text `raw`, where `outer` is the
+/// span of the full line (`outer.start` = byte offset of `raw[0]` in the
+/// source, `outer.col` = its byte column). `sub` must be a subslice of `raw`.
+fn sub_span(outer: Span, raw: &str, sub: &str) -> Span {
+    let delta = sub.as_ptr() as usize - raw.as_ptr() as usize;
+    debug_assert!(
+        delta + sub.len() <= raw.len(),
+        "sub is not a subslice of raw"
+    );
+    Span::new(
+        outer.start + delta,
+        outer.start + delta + sub.len(),
+        outer.line,
+        outer.col + delta as u32,
+    )
 }
 
-fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned], base_span: Span) -> InlineContent {
+fn build_inline_content(text: &str, span: Span) -> InlineContent {
+    let tokens = lexer::tokenize_inline(text, span);
+    tokens_to_inline_content(&tokens)
+}
+
+/// Build an inline segment for a delimited run (bold/italic/strikethrough).
+/// `open_span` is the opening delimiter's span; the closing delimiter (or, if
+/// unclosed, the last inner token) bounds the segment's end.
+fn delimited_span(open_span: Span, inner: &[crate::tokens::Spanned], close: Option<Span>) -> Span {
+    match close {
+        Some(close_span) => open_span.merge(close_span),
+        None => match inner.last() {
+            Some(last) => open_span.merge(last.span),
+            None => open_span,
+        },
+    }
+}
+
+fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent {
     let mut segments: Vec<InlineSegment> = Vec::new();
     let mut i = 0;
 
+    let mut push = |kind: InlineKind, span: Span| {
+        segments.push(InlineSegment { kind, span });
+    };
+
     while i < tokens.len() {
+        let tok_span = tokens[i].span;
         match &tokens[i].kind {
             Token::Text(t) => {
-                segments.push(InlineSegment::Text(t.clone()));
+                push(InlineKind::Text(t.clone()), tok_span);
                 i += 1;
             }
             Token::InlineCode(c) => {
-                segments.push(InlineSegment::Code(c.clone()));
+                push(InlineKind::Code(c.clone()), tok_span);
                 i += 1;
             }
             Token::BoldDelim => {
                 // Collect inner tokens until matching BoldDelim
                 i += 1;
                 let inner_end = find_matching_delim(&tokens[i..], Token::BoldDelim);
-                let inner = tokens_to_inline_content(&tokens[i..i + inner_end], base_span);
-                segments.push(InlineSegment::Bold(inner));
+                let inner_toks = &tokens[i..i + inner_end];
+                let close = tokens.get(i + inner_end).map(|t| t.span);
+                let inner = tokens_to_inline_content(inner_toks);
+                push(
+                    InlineKind::Bold(inner),
+                    delimited_span(tok_span, inner_toks, close),
+                );
                 i += inner_end + 1; // skip closing delim
             }
             Token::ItalicDelim => {
                 i += 1;
                 let inner_end = find_matching_delim(&tokens[i..], Token::ItalicDelim);
-                let inner = tokens_to_inline_content(&tokens[i..i + inner_end], base_span);
-                segments.push(InlineSegment::Italic(inner));
+                let inner_toks = &tokens[i..i + inner_end];
+                let close = tokens.get(i + inner_end).map(|t| t.span);
+                let inner = tokens_to_inline_content(inner_toks);
+                push(
+                    InlineKind::Italic(inner),
+                    delimited_span(tok_span, inner_toks, close),
+                );
                 i += inner_end + 1;
             }
             Token::StrikethroughDelim => {
                 i += 1;
                 let inner_end = find_matching_delim(&tokens[i..], Token::StrikethroughDelim);
-                let inner = tokens_to_inline_content(&tokens[i..i + inner_end], base_span);
-                segments.push(InlineSegment::Strikethrough(inner));
+                let inner_toks = &tokens[i..i + inner_end];
+                let close = tokens.get(i + inner_end).map(|t| t.span);
+                let inner = tokens_to_inline_content(inner_toks);
+                push(
+                    InlineKind::Strikethrough(inner),
+                    delimited_span(tok_span, inner_toks, close),
+                );
                 i += inner_end + 1;
             }
             Token::Link {
@@ -906,55 +969,40 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned], base_span: Span) 
                 meta,
             } => {
                 let (link_tags, attrs) = match meta.as_deref() {
-                    Some(m) => parse_metadata(m, base_span),
+                    Some(m) => parse_metadata(m, tok_span),
                     None => (Vec::new(), HashMap::new()),
                 };
-                segments.push(InlineSegment::Link(Link {
-                    text: text.clone(),
-                    url: url.clone(),
-                    title: title.clone(),
-                    tags: link_tags,
-                    attributes: attrs,
-                }));
+                push(
+                    InlineKind::Link(Link {
+                        text: text.clone(),
+                        url: url.clone(),
+                        title: title.clone(),
+                        tags: link_tags,
+                        attributes: attrs,
+                    }),
+                    tok_span,
+                );
                 i += 1;
             }
             Token::FootnoteRef { label } => {
-                segments.push(InlineSegment::FootnoteRef(label.clone()));
+                push(InlineKind::FootnoteRef(label.clone()), tok_span);
                 i += 1;
             }
             Token::Tag(kw) => {
-                let arg = if i + 1 < tokens.len() {
-                    if let Token::TagArg(a) = &tokens[i + 1].kind {
-                        i += 1;
-                        Some(a.as_str())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let tag = tags::parse_tag(kw.as_str(), arg, base_span);
-                segments.push(InlineSegment::Tag(tag));
+                let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
+                let tag = tags::parse_tag(kw.as_str(), arg, span);
+                push(InlineKind::Tag(tag), span);
                 i += 1;
             }
             Token::UnknownTag { name } => {
-                let arg = if i + 1 < tokens.len() {
-                    if let Token::TagArg(a) = &tokens[i + 1].kind {
-                        i += 1;
-                        Some(a.as_str())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let tag = tags::parse_tag(name, arg, base_span);
-                segments.push(InlineSegment::Tag(tag));
+                let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
+                let tag = tags::parse_tag(name, arg, span);
+                push(InlineKind::Tag(tag), span);
                 i += 1;
             }
             Token::TagArg(a) => {
                 // Stray tag arg without a preceding tag — treat as text
-                segments.push(InlineSegment::Text(a.clone()));
+                push(InlineKind::Text(a.clone()), tok_span);
                 i += 1;
             }
             _ => {
@@ -964,6 +1012,23 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned], base_span: Span) 
     }
 
     InlineContent { segments }
+}
+
+/// If the token after `*i` is a `TagArg`, consume it and return the argument
+/// text plus the tag span extended to cover the argument.
+fn take_tag_arg<'a>(
+    tokens: &'a [crate::tokens::Spanned],
+    i: &mut usize,
+    tag_span: Span,
+) -> (Option<&'a str>, Span) {
+    if let Some(next) = tokens.get(*i + 1)
+        && let Token::TagArg(a) = &next.kind
+    {
+        *i += 1;
+        (Some(a.as_str()), tag_span.merge(next.span))
+    } else {
+        (None, tag_span)
+    }
 }
 
 fn find_matching_delim(tokens: &[crate::tokens::Spanned], delim: Token) -> usize {
@@ -1118,13 +1183,13 @@ mod tests {
             para.content
                 .segments
                 .iter()
-                .any(|s| matches!(s, InlineSegment::Bold(_)))
+                .any(|s| matches!(s.kind, InlineKind::Bold(_)))
         );
         assert!(
             para.content
                 .segments
                 .iter()
-                .any(|s| matches!(s, InlineSegment::Italic(_)))
+                .any(|s| matches!(s.kind, InlineKind::Italic(_)))
         );
     }
 
@@ -1148,7 +1213,7 @@ mod tests {
             para.content
                 .segments
                 .iter()
-                .any(|s| matches!(s, InlineSegment::Link(_)))
+                .any(|s| matches!(s.kind, InlineKind::Link(_)))
         );
     }
 
@@ -1354,6 +1419,139 @@ mod tests {
         } else {
             panic!("expected nested list for parent two");
         }
+    }
+
+    /// Helper: the first paragraph of a parsed document.
+    fn first_paragraph(result: &ParseResult) -> &Paragraph {
+        result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("document should contain a paragraph")
+    }
+
+    fn slice<'a>(src: &'a str, span: &Span) -> &'a str {
+        &src[span.start..span.end]
+    }
+
+    #[test]
+    fn test_inline_spans_slice_source() {
+        // Fixture with bold, inline code, a link, and a #tag on one line.
+        let src = "Intro **bold** with `code` and [click](https://example.com) plus #todo fix it\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let segs = &para.content.segments;
+
+        type KindCheck = fn(&InlineKind) -> bool;
+        let expected: &[(&str, KindCheck)] = &[
+            ("Intro ", |k| matches!(k, InlineKind::Text(_))),
+            ("**bold**", |k| matches!(k, InlineKind::Bold(_))),
+            (" with ", |k| matches!(k, InlineKind::Text(_))),
+            ("`code`", |k| matches!(k, InlineKind::Code(_))),
+            (" and ", |k| matches!(k, InlineKind::Text(_))),
+            ("[click](https://example.com)", |k| {
+                matches!(k, InlineKind::Link(_))
+            }),
+            (" plus ", |k| matches!(k, InlineKind::Text(_))),
+            ("#todo fix it", |k| matches!(k, InlineKind::Tag(_))),
+        ];
+
+        assert_eq!(segs.len(), expected.len(), "segments: {segs:#?}");
+        for (seg, (text, kind_ok)) in segs.iter().zip(expected) {
+            assert!(kind_ok(&seg.kind), "unexpected kind for {text:?}: {seg:#?}");
+            assert_eq!(slice(src, &seg.span), *text);
+            assert_eq!(seg.span.line, 1);
+            // Byte column is 1-based: start offset on line 1 is col - 1.
+            assert_eq!(seg.span.col as usize, seg.span.start + 1);
+        }
+
+        // Inner segment of the bold run points at "bold" itself.
+        if let InlineKind::Bold(inner) = &segs[1].kind {
+            assert_eq!(slice(src, &inner.segments[0].span), "bold");
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn test_inline_spans_multibyte_and_offset_lines() {
+        // Heading + blank line push the paragraph to line 3; "café" has a
+        // two-byte 'é' so byte offsets and byte columns diverge from chars.
+        let src = "# Título\n\ncafé **gras** et `α` fin\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        // Heading content span slices to the text after "# ".
+        let heading = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::Heading(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(slice(src, &heading.content.segments[0].span), "Título");
+        assert_eq!(heading.content.segments[0].span.line, 1);
+        assert_eq!(heading.content.segments[0].span.col, 3);
+
+        let para = first_paragraph(&result);
+        let segs = &para.content.segments;
+        assert_eq!(slice(src, &segs[0].span), "café ");
+        assert_eq!(slice(src, &segs[1].span), "**gras**");
+        assert_eq!(slice(src, &segs[2].span), " et ");
+        assert_eq!(slice(src, &segs[3].span), "`α`");
+        assert_eq!(slice(src, &segs[4].span), " fin");
+        for seg in segs {
+            assert_eq!(seg.span.line, 3);
+        }
+        // "café " is 6 bytes, so the bold run starts at byte column 7.
+        assert_eq!(segs[1].span.col, 7);
+        assert!(matches!(&segs[0].kind, InlineKind::Text(t) if t == "café "));
+    }
+
+    #[test]
+    fn test_inline_spans_multiline_paragraph() {
+        let src = "first line\nsecond **b** line\n";
+        let result = parse_document(src);
+        let para = first_paragraph(&result);
+
+        let bold = para
+            .content
+            .segments
+            .iter()
+            .find(|s| matches!(s.kind, InlineKind::Bold(_)))
+            .unwrap();
+        assert_eq!(slice(src, &bold.span), "**b**");
+        assert_eq!(bold.span.line, 2);
+        assert_eq!(bold.span.col, 8);
+    }
+
+    #[test]
+    fn test_inline_spans_list_item_and_footnote_ref() {
+        let src = "- [ ] task with `code` and [^1]\n";
+        let result = parse_document(src);
+        let list = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::List(l) => Some(l),
+                _ => None,
+            })
+            .unwrap();
+
+        let segs = &list.items[0].content.segments;
+        assert_eq!(slice(src, &segs[0].span), "task with ");
+        assert_eq!(slice(src, &segs[1].span), "`code`");
+        assert_eq!(slice(src, &segs[3].span), "[^1]");
+        assert!(matches!(segs[3].kind, InlineKind::FootnoteRef(_)));
     }
 
     #[test]

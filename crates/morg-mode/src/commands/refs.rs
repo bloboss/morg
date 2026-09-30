@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use morg_parser::ast::{Block, InlineSegment};
+use morg_parser::ast::{Block, InlineKind, InlineSegment};
 
 use crate::collect;
 
@@ -92,15 +92,15 @@ fn collect_link_refs(
     id_refs: &mut Vec<(String, PathBuf, u32)>,
 ) {
     for seg in segments {
-        match seg {
-            InlineSegment::Link(link) => {
+        match &seg.kind {
+            InlineKind::Link(link) => {
                 if let Some(id) = link.url.strip_prefix("id:") {
                     id_refs.push((id.to_string(), file.to_path_buf(), line));
                 }
             }
-            InlineSegment::Bold(inner)
-            | InlineSegment::Italic(inner)
-            | InlineSegment::Strikethrough(inner) => {
+            InlineKind::Bold(inner)
+            | InlineKind::Italic(inner)
+            | InlineKind::Strikethrough(inner) => {
                 collect_link_refs(&inner.segments, file, line, id_refs);
             }
             _ => {}

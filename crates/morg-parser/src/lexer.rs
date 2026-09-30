@@ -344,16 +344,86 @@ fn classify_line(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
 /// Tokenize inline content from raw text. Called by the parser when it needs
 /// to break a text line into inline segments (bold, italic, tags, links, etc.).
-pub fn tokenize_inline(text: &str, span: Span) -> Vec<Spanned> {
+///
+/// `base` describes where `text` sits in the original source file:
+/// `base.start` must be the absolute byte offset of `text`'s first byte, and
+/// `base.line`/`base.col` the (1-based) line and byte column of that byte.
+/// Every returned token then carries a span whose `start`/`end` are absolute
+/// byte offsets into the source file and whose `line`/`col` locate the
+/// token's first byte (newlines inside `text` are tracked, so multi-line
+/// paragraphs get per-line positions).
+pub fn tokenize_inline(text: &str, base: Span) -> Vec<Spanned> {
     let mut out = Vec::new();
-    tokenize_inline_into(text, span, &mut out);
+    tokenize_inline_into(text, base, &mut out);
     out
 }
 
-fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
+/// Incrementally maps byte indices within a text fragment to spans that are
+/// absolute within the original source file. Indices must be visited in
+/// non-decreasing order (tokens are emitted left to right).
+struct SpanTracker<'t> {
+    text: &'t [u8],
+    base: Span,
+    /// Byte index in `text` that `line`/`col` currently describe.
+    scanned: usize,
+    line: u32,
+    col: u32,
+}
+
+impl<'t> SpanTracker<'t> {
+    fn new(text: &'t str, base: Span) -> Self {
+        Self {
+            text: text.as_bytes(),
+            base,
+            scanned: 0,
+            line: base.line,
+            col: base.col,
+        }
+    }
+
+    /// Span for `text[start..end]`, with absolute byte offsets and the
+    /// line/col of `start`.
+    fn span(&mut self, start: usize, end: usize) -> Span {
+        while self.scanned < start {
+            if self.text[self.scanned] == b'\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
+            self.scanned += 1;
+        }
+        Span::new(
+            self.base.start + start,
+            self.base.start + end,
+            self.line,
+            self.col,
+        )
+    }
+}
+
+fn tokenize_inline_into(text: &str, base: Span, out: &mut Vec<Spanned>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut current_text = String::new();
+    // Byte index in `text` where the pending text run began.
+    let mut run_start = 0usize;
+    let mut tracker = SpanTracker::new(text, base);
+
+    fn flush(
+        buf: &mut String,
+        run_start: usize,
+        run_end: usize,
+        tracker: &mut SpanTracker<'_>,
+        out: &mut Vec<Spanned>,
+    ) {
+        if !buf.is_empty() {
+            out.push(Spanned {
+                kind: Token::Text(std::mem::take(buf)),
+                span: tracker.span(run_start, run_end),
+            });
+        }
+    }
 
     while i < bytes.len() {
         let ch = bytes[i];
@@ -362,9 +432,15 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
         if ch == b'\\' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             if next == b'#' || next == b'[' || next == b'*' || next == b'~' || next == b'`' {
+                if current_text.is_empty() {
+                    run_start = i;
+                }
                 current_text.push(next as char);
                 i += 2;
                 continue;
+            }
+            if current_text.is_empty() {
+                run_start = i;
             }
             current_text.push('\\');
             i += 1;
@@ -375,10 +451,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
         if ch == b'`'
             && let Some((code, end)) = scan_backtick_code(text, i)
         {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::InlineCode(code.to_string()),
-                span,
+                span: tracker.span(i, end),
             });
             i = end;
             continue;
@@ -386,10 +462,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
         // Bold **
         if ch == b'*' && peek(bytes, i + 1) == Some(b'*') {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::BoldDelim,
-                span,
+                span: tracker.span(i, i + 2),
             });
             i += 2;
             continue;
@@ -397,10 +473,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
         // Strikethrough ~~
         if ch == b'~' && peek(bytes, i + 1) == Some(b'~') {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::StrikethroughDelim,
-                span,
+                span: tracker.span(i, i + 2),
             });
             i += 2;
             continue;
@@ -408,10 +484,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
         // Italic * (not **)
         if ch == b'*' && peek(bytes, i + 1) != Some(b'*') {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::ItalicDelim,
-                span,
+                span: tracker.span(i, i + 1),
             });
             i += 1;
             continue;
@@ -422,10 +498,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
             && peek(bytes, i + 1) == Some(b'^')
             && let Some((label, end)) = try_footnote_ref(text, i)
         {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::FootnoteRef { label },
-                span,
+                span: tracker.span(i, end),
             });
             i = end;
             continue;
@@ -435,10 +511,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
         if ch == b'['
             && let Some((link_tok, end)) = try_link(text, i)
         {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: link_tok,
-                span,
+                span: tracker.span(i, end),
             });
             i = end;
             continue;
@@ -449,34 +525,39 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
             if let Some(next) = peek(bytes, i + 1)
                 && ((next as char).is_alphanumeric() || next == b'_')
             {
-                flush_text_token(&mut current_text, span, out);
-                let (tok, arg_tok, end) = tokenize_tag(text, i + 1, span);
-                out.push(Spanned { kind: tok, span });
-                if let Some(at) = arg_tok {
-                    out.push(Spanned { kind: at, span });
+                flush(&mut current_text, run_start, i, &mut tracker, out);
+                let tag = tokenize_tag(text, i + 1);
+                out.push(Spanned {
+                    kind: tag.token,
+                    span: tracker.span(i, tag.name_end),
+                });
+                if let Some((arg_tok, arg_start, arg_end)) = tag.arg {
+                    out.push(Spanned {
+                        kind: arg_tok,
+                        span: tracker.span(arg_start, arg_end),
+                    });
                 }
-                i = end;
+                i = tag.end;
                 continue;
+            }
+            if current_text.is_empty() {
+                run_start = i;
             }
             current_text.push('#');
             i += 1;
             continue;
         }
 
-        current_text.push(ch as char);
-        i += 1;
+        // Plain character — push the whole (possibly multi-byte) char.
+        if current_text.is_empty() {
+            run_start = i;
+        }
+        let c = text[i..].chars().next().unwrap();
+        current_text.push(c);
+        i += c.len_utf8();
     }
 
-    flush_text_token(&mut current_text, span, out);
-}
-
-fn flush_text_token(buf: &mut String, span: Span, out: &mut Vec<Spanned>) {
-    if !buf.is_empty() {
-        out.push(Spanned {
-            kind: Token::Text(std::mem::take(buf)),
-            span,
-        });
-    }
+    flush(&mut current_text, run_start, i, &mut tracker, out);
 }
 
 // ===========================================================================
@@ -743,7 +824,21 @@ fn parse_link_paren(inner: &str) -> (String, Option<String>, Option<String>) {
     (url, title, meta)
 }
 
-fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<Token>, usize) {
+/// Result of scanning a `#name [arg]` inline tag.
+struct ScannedTag {
+    /// The tag token itself (`Tag` or `UnknownTag`).
+    token: Token,
+    /// Byte index (in the scanned text) just past the tag name.
+    name_end: usize,
+    /// Optional argument token with the byte range of its trimmed raw text.
+    arg: Option<(Token, usize, usize)>,
+    /// Byte index just past everything consumed by this tag.
+    end: usize,
+}
+
+/// Scan a tag starting at `name_start` (the byte after `#`; the `#` itself is
+/// at `name_start - 1`).
+fn tokenize_tag(text: &str, name_start: usize) -> ScannedTag {
     let bytes = text.as_bytes();
     let mut pos = name_start;
 
@@ -756,7 +851,8 @@ fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<To
         }
     }
 
-    let name = &text[name_start..pos];
+    let name_end = pos;
+    let name = &text[name_start..name_end];
     let tok = match Keyword::from_str(name) {
         Some(kw) => Token::Tag(kw),
         None => Token::UnknownTag {
@@ -765,8 +861,9 @@ fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<To
     };
 
     let mut arg = String::new();
-    if pos < bytes.len() && bytes[pos] == b' ' {
+    let arg_scan_start = if pos < bytes.len() && bytes[pos] == b' ' {
         pos += 1;
+        let scan_start = pos;
         while pos < bytes.len() {
             let c = bytes[pos];
             if c == b'#'
@@ -785,21 +882,37 @@ fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<To
                 pos += 1;
                 continue;
             }
-            arg.push(c as char);
-            pos += 1;
+            let ch = text[pos..].chars().next().unwrap();
+            arg.push(ch);
+            pos += ch.len_utf8();
         }
-    }
+        Some(scan_start)
+    } else {
+        None
+    };
 
     let arg_tok = {
         let trimmed = arg.trim();
         if trimmed.is_empty() {
             None
         } else {
-            Some(Token::TagArg(trimmed.to_string()))
+            // Recover the raw byte range of the trimmed argument: escape
+            // sequences only shift interior bytes, so trimming whitespace on
+            // the raw text matches trimming on the built string.
+            let scan_start = arg_scan_start.unwrap_or(pos);
+            let raw = &text[scan_start..pos];
+            let arg_start = scan_start + (raw.len() - raw.trim_start().len());
+            let arg_end = scan_start + raw.trim_end().len();
+            Some((Token::TagArg(trimmed.to_string()), arg_start, arg_end))
         }
     };
 
-    (tok, arg_tok, pos)
+    ScannedTag {
+        token: tok,
+        name_end,
+        arg: arg_tok,
+        end: pos,
+    }
 }
 
 // ===========================================================================
