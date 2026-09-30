@@ -522,8 +522,8 @@ fn tokenize_inline_into(text: &str, base: Span, out: &mut Vec<Spanned>) {
 
         // Tag
         if ch == b'#' {
-            if let Some(next) = peek(bytes, i + 1)
-                && ((next as char).is_alphanumeric() || next == b'_')
+            if let Some(next) = text[i + 1..].chars().next()
+                && (next.is_alphanumeric() || next == '_')
             {
                 flush(&mut current_text, run_start, i, &mut tracker, out);
                 let tag = tokenize_tag(text, i + 1);
@@ -842,10 +842,9 @@ fn tokenize_tag(text: &str, name_start: usize) -> ScannedTag {
     let bytes = text.as_bytes();
     let mut pos = name_start;
 
-    while pos < bytes.len() {
-        let c = bytes[pos] as char;
+    for c in text[name_start..].chars() {
         if c.is_alphanumeric() || c == '-' || c == '_' {
-            pos += 1;
+            pos += c.len_utf8();
         } else {
             break;
         }
@@ -867,8 +866,8 @@ fn tokenize_tag(text: &str, name_start: usize) -> ScannedTag {
         while pos < bytes.len() {
             let c = bytes[pos];
             if c == b'#'
-                && let Some(next) = peek(bytes, pos + 1)
-                && ((next as char).is_alphanumeric() || next == b'_')
+                && let Some(next) = text[pos + 1..].chars().next()
+                && (next.is_alphanumeric() || next == '_')
             {
                 break;
             }
@@ -1022,6 +1021,46 @@ mod tests {
         assert!(matches!(&tokens[0], Token::Text(t) if t == "some text "));
         assert!(matches!(&tokens[1], Token::Tag(Keyword::Todo)));
         assert!(matches!(&tokens[2], Token::TagArg(a) if a == "fix this"));
+    }
+
+    #[test]
+    fn test_inline_tag_multibyte_name() {
+        // Tag names may contain non-ASCII alphanumerics; the scanner must
+        // advance whole chars, never landing inside a multi-byte sequence.
+        let tokens = inline_tokens("note #café fix accents");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "note "));
+        assert!(matches!(&tokens[1], Token::UnknownTag { name } if name == "café"));
+        assert!(matches!(&tokens[2], Token::TagArg(a) if a == "fix accents"));
+
+        let tokens = inline_tokens("#日本語タグ 引数はこちら");
+        assert!(matches!(&tokens[0], Token::UnknownTag { name } if name == "日本語タグ"));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "引数はこちら"));
+    }
+
+    #[test]
+    fn test_inline_tag_multibyte_spans() {
+        // Spans must slice the source exactly even around multi-byte chars.
+        let src = "αβ #todo fíx это";
+        let spanned = tokenize_inline(src, Span::new(0, src.len(), 1, 1));
+        for s in &spanned {
+            match &s.kind {
+                Token::Tag(_) => assert_eq!(&src[s.span.start..s.span.end], "#todo"),
+                Token::TagArg(a) => assert_eq!(&src[s.span.start..s.span.end], a.as_str()),
+                Token::Text(t) => assert_eq!(&src[s.span.start..s.span.end], t.as_str()),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_inline_tag_arg_stops_at_next_multibyte_tag() {
+        // A '#' followed by a multi-byte alphanumeric starts a new tag; the
+        // old byte-cast check misread the first UTF-8 byte here.
+        let tokens = inline_tokens("#todo done #über arg");
+        assert!(matches!(&tokens[0], Token::Tag(Keyword::Todo)));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "done"));
+        assert!(matches!(&tokens[2], Token::UnknownTag { name } if name == "über"));
+        assert!(matches!(&tokens[3], Token::TagArg(a) if a == "arg"));
     }
 
     #[test]
