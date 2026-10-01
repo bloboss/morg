@@ -17,7 +17,7 @@ pub fn run(
         let title = parsed
             .first()
             .and_then(|pf| pf.document.frontmatter.as_ref())
-            .and_then(|fm| fm.data.get("title"))
+            .and_then(|fm| fm.data.as_mapping_get("title"))
             .and_then(|v| v.as_str())
             .unwrap_or("morg document");
 

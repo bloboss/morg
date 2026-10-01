@@ -1,3 +1,7 @@
+/// Re-exported YAML library used for [`ast::Frontmatter::data`], so
+/// downstream crates can match on the value without their own dependency.
+pub use saphyr;
+
 pub mod ast;
 pub mod error;
 pub mod lexer;

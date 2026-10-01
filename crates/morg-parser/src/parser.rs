@@ -53,10 +53,9 @@ fn parse_frontmatter(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Optio
         return None;
     }
 
+    let source = lex.source();
     let open_span = lex.advance().span;
     skip_newline(lex);
-
-    let mut yaml_lines: Vec<String> = Vec::new();
 
     loop {
         if lex.is_eof() {
@@ -73,11 +72,23 @@ fn parse_frontmatter(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Optio
             let close_span = lex.advance().span;
             skip_newline(lex);
 
-            let raw = yaml_lines.join("\n");
+            // Slice the YAML text straight from the source (between the
+            // newline after the opening `---` and the newline before the
+            // closing one) so parsed markers line up with file offsets.
+            let content_start = (open_span.end + 1).min(close_span.start);
+            let content_end = close_span.start.saturating_sub(1).max(content_start);
+            let raw = source[content_start..content_end].to_string();
             let span = open_span.merge(close_span);
 
-            match serde_yaml::from_str(&raw) {
-                Ok(data) => return Some(Frontmatter { raw, data, span }),
+            match load_frontmatter_yaml(&raw, content_start, open_span.line + 1) {
+                Ok((data, entries)) => {
+                    return Some(Frontmatter {
+                        raw,
+                        data,
+                        entries,
+                        span,
+                    });
+                }
                 Err(e) => {
                     errors.push(ParseError {
                         kind: ParseErrorKind::InvalidYaml,
@@ -89,9 +100,96 @@ fn parse_frontmatter(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Optio
             }
         }
 
-        // Collect raw line content
-        let raw = extract_raw_line(lex);
-        yaml_lines.push(raw);
+        lex.skip_to_next_line();
+    }
+}
+
+/// Parse frontmatter YAML with `saphyr`, returning the plain value tree plus
+/// per-entry spans for the top-level mapping.
+///
+/// `base_offset` is the absolute byte offset of `raw`'s first byte in the
+/// source; `base_line` its 1-based line. Saphyr markers are char-indexed
+/// into `raw`, so they are mapped back to byte offsets before being
+/// absolutized.
+fn load_frontmatter_yaml(
+    raw: &str,
+    base_offset: usize,
+    base_line: u32,
+) -> Result<(saphyr::YamlOwned, Vec<FrontmatterEntry>), saphyr::ScanError> {
+    use saphyr::{LoadableYamlNode, MarkedYamlOwned, ScalarOwned, YamlDataOwned, YamlOwned};
+
+    let mut docs = MarkedYamlOwned::load_from_str(raw)?;
+    if docs.is_empty() {
+        // Empty or comment-only frontmatter — same as YAML `null`.
+        return Ok((YamlOwned::Value(ScalarOwned::Null), Vec::new()));
+    }
+    let marked = docs.remove(0);
+
+    // Char index (saphyr markers) → byte offset in `raw`.
+    let char_to_byte: Vec<usize> = raw
+        .char_indices()
+        .map(|(b, _)| b)
+        .chain(std::iter::once(raw.len()))
+        .collect();
+    let to_byte =
+        |char_idx: usize| -> usize { char_to_byte.get(char_idx).copied().unwrap_or(raw.len()) };
+    let abs_span = |start_b: usize, end_b: usize| -> Span {
+        let prefix = &raw[..start_b];
+        let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        Span::new(
+            base_offset + start_b,
+            base_offset + end_b,
+            base_line + prefix.matches('\n').count() as u32,
+            (start_b - line_start) as u32 + 1,
+        )
+    };
+
+    let mut entries = Vec::new();
+    if let YamlDataOwned::Mapping(map) = &marked.data {
+        for (k, v) in map {
+            let Some(key) = k.data.as_str() else {
+                continue; // non-string key — no typed entry for it
+            };
+            let key_span = abs_span(to_byte(k.span.start.index()), to_byte(k.span.end.index()));
+
+            // The value's end marker may extend past the value text (e.g.
+            // over the newline after a block sequence); trim it back.
+            let v_start = to_byte(v.span.start.index());
+            let v_end = to_byte(v.span.end.index()).max(v_start);
+            let v_end = v_start + raw[v_start..v_end].trim_end().len();
+            let value_span = abs_span(v_start, v_end);
+
+            entries.push(FrontmatterEntry {
+                key: key.to_string(),
+                key_span,
+                value_span,
+            });
+        }
+    }
+
+    Ok((marked_to_plain(marked), entries))
+}
+
+/// Strip span annotations from a `MarkedYamlOwned` tree, yielding the plain
+/// `YamlOwned` stored on the AST.
+fn marked_to_plain(node: saphyr::MarkedYamlOwned) -> saphyr::YamlOwned {
+    use saphyr::{YamlDataOwned, YamlOwned};
+    match node.data {
+        YamlDataOwned::Representation(s, style, tag) => YamlOwned::Representation(s, style, tag),
+        YamlDataOwned::Value(scalar) => YamlOwned::Value(scalar),
+        YamlDataOwned::Sequence(seq) => {
+            YamlOwned::Sequence(seq.into_iter().map(marked_to_plain).collect())
+        }
+        YamlDataOwned::Mapping(map) => YamlOwned::Mapping(
+            map.into_iter()
+                .map(|(k, v)| (marked_to_plain(k), marked_to_plain(v)))
+                .collect(),
+        ),
+        YamlDataOwned::Tagged(tag, inner) => {
+            YamlOwned::Tagged(tag, Box::new(marked_to_plain(*inner)))
+        }
+        YamlDataOwned::Alias(id) => YamlOwned::Alias(id),
+        YamlDataOwned::BadValue => YamlOwned::BadValue,
     }
 }
 
@@ -1634,6 +1732,124 @@ mod tests {
             para.content.segments
         );
         assert_eq!(para.content.plain_text(), "bad [@] and [@unclosed");
+    }
+
+    #[test]
+    fn test_frontmatter_entry_spans_slice_source() {
+        let src = "---\ntitle: Test note\ntags:\n  - alpha\n  - beta\ncount: 3\n---\n\nBody.\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        assert_eq!(
+            fm.raw,
+            "title: Test note\ntags:\n  - alpha\n  - beta\ncount: 3"
+        );
+
+        let keys: Vec<&str> = fm.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["title", "tags", "count"]);
+
+        let title = fm.entry("title").unwrap();
+        assert_eq!(slice(src, &title.key_span), "title");
+        assert_eq!(slice(src, &title.value_span), "Test note");
+        assert_eq!(title.key_span.line, 2);
+        assert_eq!(title.key_span.col, 1);
+
+        let tags = fm.entry("tags").unwrap();
+        assert_eq!(slice(src, &tags.key_span), "tags");
+        assert_eq!(slice(src, &tags.value_span), "- alpha\n  - beta");
+        assert_eq!(tags.key_span.line, 3);
+
+        let count = fm.entry("count").unwrap();
+        assert_eq!(slice(src, &count.key_span), "count");
+        assert_eq!(slice(src, &count.value_span), "3");
+        assert_eq!(count.key_span.line, 6);
+
+        // The typed data is still a plain value tree.
+        assert_eq!(
+            fm.data.as_mapping_get("title").and_then(|v| v.as_str()),
+            Some("Test note")
+        );
+        assert_eq!(
+            fm.data.as_mapping_get("count").and_then(|v| v.as_integer()),
+            Some(3)
+        );
+        assert_eq!(
+            fm.data
+                .as_mapping_get("tags")
+                .and_then(|v| v.as_sequence())
+                .map(|s| s.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_frontmatter_entry_spans_multibyte() {
+        // Multi-byte chars in keys and values: saphyr markers are
+        // char-indexed, so byte-exact slicing exercises the conversion.
+        let src = "---\ntítulo: Café crème\nétiquettes:\n  - détail\nn: 1\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+
+        let titulo = fm.entry("título").unwrap();
+        assert_eq!(slice(src, &titulo.key_span), "título");
+        assert_eq!(slice(src, &titulo.value_span), "Café crème");
+        assert_eq!(titulo.key_span.line, 2);
+        assert_eq!(titulo.key_span.col, 1);
+
+        let etiquettes = fm.entry("étiquettes").unwrap();
+        assert_eq!(slice(src, &etiquettes.key_span), "étiquettes");
+        assert_eq!(slice(src, &etiquettes.value_span), "- détail");
+        assert_eq!(etiquettes.key_span.line, 3);
+
+        let n = fm.entry("n").unwrap();
+        assert_eq!(slice(src, &n.key_span), "n");
+        assert_eq!(slice(src, &n.value_span), "1");
+        assert_eq!(n.key_span.line, 5);
+    }
+
+    #[test]
+    fn test_frontmatter_quoted_and_empty_values() {
+        let src = "---\nquoted: \"hello world\"\nempty:\n---\nBody.\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+
+        let quoted = fm.entry("quoted").unwrap();
+        // The value span covers the source markup, quotes included.
+        assert_eq!(slice(src, &quoted.value_span), "\"hello world\"");
+        assert_eq!(
+            fm.data.as_mapping_get("quoted").and_then(|v| v.as_str()),
+            Some("hello world")
+        );
+
+        let empty = fm.entry("empty").unwrap();
+        assert_eq!(slice(src, &empty.key_span), "empty");
+        assert_eq!(slice(src, &empty.value_span), "");
+    }
+
+    #[test]
+    fn test_frontmatter_empty_and_invalid() {
+        // Empty frontmatter parses to a null value with no entries.
+        let result = parse_document("---\n---\nBody.\n");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        assert!(fm.raw.is_empty());
+        assert!(fm.entries.is_empty());
+        assert!(fm.data.is_null());
+
+        // Invalid YAML is reported and drops the frontmatter, as before.
+        let result = parse_document("---\na: [unclosed\n---\nBody.\n");
+        assert!(result.document.frontmatter.is_none());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ParseErrorKind::InvalidYaml))
+        );
     }
 
     #[test]

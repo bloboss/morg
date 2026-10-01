@@ -9,11 +9,39 @@ pub struct Document {
     pub children: Vec<Block>,
 }
 
+/// YAML frontmatter delimited by `---` lines at the top of a document.
+///
+/// `raw` is the exact source text between the delimiters, so spans in
+/// `entries` can be checked against it (or against the whole source — all
+/// spans are absolute, like inline-segment spans).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Frontmatter {
     pub raw: String,
-    pub data: serde_yaml::Value,
+    pub data: saphyr::YamlOwned,
+    /// Per-entry spans for the top-level mapping, in document order.
+    /// Empty when the document root is not a mapping.
+    pub entries: Vec<FrontmatterEntry>,
     pub span: Span,
+}
+
+impl Frontmatter {
+    /// The entry for a top-level key, if present.
+    pub fn entry(&self, key: &str) -> Option<&FrontmatterEntry> {
+        self.entries.iter().find(|e| e.key == key)
+    }
+}
+
+/// Source location of one top-level `key: value` frontmatter entry.
+///
+/// `key_span` covers the key text; `value_span` covers the value's source
+/// text (including any quotes or block markers, trailing whitespace
+/// trimmed). Both slice the original document source exactly. For an empty
+/// value (`key:`), `value_span` is empty and sits just past the colon.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrontmatterEntry {
+    pub key: String,
+    pub key_span: Span,
+    pub value_span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
