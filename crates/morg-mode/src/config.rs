@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use morg_parser::tag_table::{CustomArgKind, TagDeclaration, TagTable};
+use morg_parser::tag_table::{ArgShape, CustomArgKind, TagDeclaration, TagTable};
 use serde::Deserialize;
 
 /// Top-level configuration.
@@ -24,13 +24,17 @@ pub struct Config {
     pub capture: CaptureConfig,
 
     /// User-defined tag declarations: `[tags.<name>]` with `pattern` (regex
-    /// with named capture groups) or `kind` (duration | date | timestamp |
-    /// slug). BTreeMap keeps build errors deterministic.
+    /// with named capture groups), `kind` (duration | date | timestamp |
+    /// slug), and/or `shape` (greedy | quoted | word | kv | until-punct).
+    /// BTreeMap keeps build errors (and `emit-grammar` output) deterministic.
     pub tags: BTreeMap<String, TagConfig>,
+
+    /// `morg emit-grammar` configuration.
+    pub grammar: GrammarConfig,
 }
 
-/// One `[tags.<name>]` entry. Exactly one of `pattern`/`kind` must be set;
-/// [`Config::build_tag_table`] enforces that.
+/// One `[tags.<name>]` entry. At most one of `pattern`/`kind`, at least one
+/// of `pattern`/`kind`/`shape`; [`Config::build_tag_table`] enforces that.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct TagConfig {
@@ -38,6 +42,17 @@ pub struct TagConfig {
     pub pattern: Option<String>,
     /// Built-in argument parser shorthand.
     pub kind: Option<String>,
+    /// Argument extent shape (plan §10.4 T2). Default: greedy.
+    pub shape: Option<String>,
+}
+
+/// `[grammar]` section: where `morg emit-grammar` finds tree-sitter-morg.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct GrammarConfig {
+    /// Directory containing tree-sitter-morg's `grammar.js`. Overridden by
+    /// `--grammar-dir`.
+    pub dir: Option<PathBuf>,
 }
 
 /// Diary configuration.
@@ -89,6 +104,7 @@ impl Default for Config {
             diary: DiaryConfig::default(),
             capture: CaptureConfig::default(),
             tags: BTreeMap::new(),
+            grammar: GrammarConfig::default(),
         }
     }
 }
@@ -144,10 +160,20 @@ impl Config {
                     })?),
                     None => None,
                 };
+                let shape = match tc.shape.as_deref() {
+                    Some(s) => Some(ArgShape::from_str(s).ok_or_else(|| {
+                        format!(
+                            "tag '{name}': unknown shape '{s}' \
+                             (expected greedy, quoted, word, kv, or until-punct)"
+                        )
+                    })?),
+                    None => None,
+                };
                 Ok(TagDeclaration {
                     name: name.clone(),
                     pattern: tc.pattern.clone(),
                     kind,
+                    shape,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -166,6 +192,9 @@ impl Config {
         }
         if let Some(ref p) = self.capture.templates_file {
             self.capture.templates_file = Some(expand_tilde(p));
+        }
+        if let Some(ref p) = self.grammar.dir {
+            self.grammar.dir = Some(expand_tilde(p));
         }
     }
 }
@@ -247,10 +276,19 @@ pub fn init_config() -> Result<(), Box<dyn std::error::Error>> {
 # User-defined tags: declare how a custom tag's argument is interpreted.
 # Either a regex `pattern` with named capture groups, or a `kind` shorthand
 # (duration | date | timestamp | slug). Built-in tag names cannot be redefined.
+# An optional `shape` (greedy | quoted | word | kv | until-punct) declares
+# where the argument ENDS at inline positions; a vault using shapes must
+# travel with its config to parse identically elsewhere.
 # [tags.book]
 # pattern = '"(?<title>[^"]+)"\s+by\s+(?<author>.+)'
 # [tags.reading-time]
 # kind = "duration"
+# [tags.task]
+# shape = "quoted"
+
+# Where `morg emit-grammar` finds tree-sitter-morg's grammar.js.
+# [grammar]
+# dir = "~/src/tree-sitter-morg"
 "#;
 
     std::fs::write(&path, default_toml)?;

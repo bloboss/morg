@@ -17,5 +17,5 @@ pub use error::{ParseError, ParseErrorKind};
 pub use line_index::{LineCol, LineIndex};
 pub use parser::{parse_document, parse_document_with};
 pub use span::Span;
-pub use tag_table::{CustomArgKind, CustomRule, TagDeclaration, TagTable, TagTableError};
+pub use tag_table::{ArgShape, CustomArgKind, CustomRule, TagDeclaration, TagTable, TagTableError};
 pub use tags::*;

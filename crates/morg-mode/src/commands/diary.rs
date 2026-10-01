@@ -315,6 +315,7 @@ mod tests {
             },
             capture: crate::config::CaptureConfig::default(),
             tags: Default::default(),
+            grammar: Default::default(),
         }
     }
 

@@ -424,15 +424,28 @@ pub fn parse_tag_with(
     span: Span,
     table: &TagTable,
 ) -> Tag {
+    parse_tag_full(name, arg, raw_arg, false, span, table)
+}
+
+/// [`parse_tag_with`], additionally carrying whether the argument's declared
+/// extent shape failed at the lexer and the greedy rule was used instead
+/// (plan §10.4 T2). The flag surfaces as `shape_mismatch` on
+/// [`TagKind::Custom`]; it is meaningless (and ignored) for built-in tags.
+pub fn parse_tag_full(
+    name: &str,
+    arg: Option<&str>,
+    raw_arg: Option<(&str, Span)>,
+    shape_fallback: bool,
+    span: Span,
+    table: &TagTable,
+) -> Tag {
     use crate::tokens::Keyword;
 
     // Built-in names can never be declared in a table (build error), so
     // custom resolution happens only for names the keyword set doesn't know.
-    if Keyword::from_str(name).is_none()
-        && let Some(rule) = table.get(name)
-    {
+    if Keyword::from_str(name).is_none() && table.contains(name) {
         return Tag {
-            kind: custom_tag_kind(name, rule, arg, raw_arg, span),
+            kind: custom_tag_kind(name, table.get(name), arg, raw_arg, shape_fallback, span),
             span,
         };
     }
@@ -532,11 +545,14 @@ fn unknown(name: &str, arg: Option<&str>) -> TagKind {
 
 /// Resolve a declared custom tag against its rule. Total: a non-matching
 /// argument yields `shape_mismatch: true` with empty fields, never an error.
+/// `rule` is `None` for shape-only (plain) declarations — no fields then.
+/// `shape_fallback` (the lexer's extent-shape failure) ORs into the flag.
 fn custom_tag_kind(
     name: &str,
-    rule: &CustomRule,
+    rule: Option<&CustomRule>,
     arg: Option<&str>,
     raw_arg: Option<(&str, Span)>,
+    shape_fallback: bool,
     span: Span,
 ) -> TagKind {
     // The text patterns match against, and the span to map field offsets
@@ -551,7 +567,10 @@ fn custom_tag_kind(
     };
 
     let fields = match rule {
-        CustomRule::Pattern(re) => re.captures(text).map(|caps| {
+        // A plain (shape-only) declaration imposes no structure: no fields,
+        // and only an extent fallback can flag the tag.
+        None => Some(Vec::new()),
+        Some(CustomRule::Pattern(re)) => re.captures(text).map(|caps| {
             re.capture_names()
                 .flatten()
                 .filter_map(|group| {
@@ -564,7 +583,7 @@ fn custom_tag_kind(
                 })
                 .collect::<Vec<_>>()
         }),
-        CustomRule::Kind(kind) => custom_kind_canonical(*kind, text).map(|canonical| {
+        Some(CustomRule::Kind(kind)) => custom_kind_canonical(*kind, text).map(|canonical| {
             vec![CustomField {
                 group: kind.as_str().to_string(),
                 value: canonical,
@@ -573,7 +592,7 @@ fn custom_tag_kind(
         }),
     };
 
-    let (fields, shape_mismatch) = match fields {
+    let (fields, rule_mismatch) = match fields {
         Some(fields) => (fields, false),
         None => (Vec::new(), true),
     };
@@ -582,7 +601,7 @@ fn custom_tag_kind(
         name: name.to_string(),
         raw: non_empty(arg.or(raw_arg.map(|(raw, _)| raw))),
         fields,
-        shape_mismatch,
+        shape_mismatch: rule_mismatch || shape_fallback,
     }
 }
 

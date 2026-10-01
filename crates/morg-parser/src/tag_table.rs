@@ -1,20 +1,27 @@
-//! User-defined tag interpretation (plan §10, T1).
+//! User-defined tag interpretation and argument extent (plan §10, T1 + T2).
 //!
 //! A [`TagTable`] holds compiled user tag declarations, typically parsed from
-//! a `[tags]` config section by a consumer crate. The table changes nothing
-//! about lexing — custom tags still lex as `UnknownTag` plus the greedy
-//! argument rule — it only upgrades those tags to [`TagKind::Custom`] at
-//! parse level via [`parse_document_with`].
+//! a `[tags]` config section by a consumer crate. Interpretation (T1) changes
+//! nothing about lexing — custom tags still lex as `UnknownTag` plus the
+//! greedy argument rule — it only upgrades those tags to [`TagKind::Custom`]
+//! at parse level via [`parse_document_with`]. A declared [`ArgShape`] (T2)
+//! additionally changes where an *inline* argument ends, which is why the
+//! inline lexer consults the table too
+//! ([`tokenize_inline_with`](crate::lexer::tokenize_inline_with)).
 //!
 //! Declarations arrive as plain Rust data ([`TagDeclaration`]) so that config
-//! layers (TOML, YAML, …) stay out of this crate. Each declaration carries
-//! exactly one interpretation rule:
+//! layers (TOML, YAML, …) stay out of this crate. Each declaration carries at
+//! most one interpretation rule, plus an optional extent shape:
 //!
 //! - `pattern`: a regex (the `regex` crate — deliberately: no lookaround, no
 //!   catastrophic backtracking) with named capture groups; compiled once when
 //!   the table is built.
 //! - `kind`: a shorthand reusing a built-in argument parser
 //!   (`duration` | `date` | `timestamp` | `slug`).
+//! - `shape`: where the argument *ends* at inline positions — a closed
+//!   vocabulary ([`ArgShape`]), never a regex at the lexer. A shape may stand
+//!   alone (a plain declaration) or compose with `pattern`/`kind` (the shape
+//!   bounds the extent; the rule then interprets the captured text).
 //!
 //! [`TagKind::Custom`]: crate::tags::TagKind::Custom
 //! [`parse_document_with`]: crate::parser::parse_document_with
@@ -27,8 +34,8 @@ use crate::tokens::Keyword;
 
 /// A single user tag declaration, as plain data (one `[tags.<name>]` entry).
 ///
-/// Exactly one of `pattern` and `kind` must be set; [`TagTable::build`]
-/// rejects everything else.
+/// At most one of `pattern` and `kind` may be set; at least one of `pattern`,
+/// `kind`, and `shape` must be. [`TagTable::build`] rejects everything else.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TagDeclaration {
     /// The tag name (without the leading `#`).
@@ -37,6 +44,63 @@ pub struct TagDeclaration {
     pub pattern: Option<String>,
     /// Shorthand reusing a built-in argument parser.
     pub kind: Option<CustomArgKind>,
+    /// Argument extent shape (T2). `None` means [`ArgShape::Greedy`].
+    pub shape: Option<ArgShape>,
+}
+
+/// The closed argument-extent vocabulary (plan §10.1(3)). Shapes change where
+/// an **inline** tag's argument ends; block-level tags always keep the
+/// whole-line extent (there the shape only structures/validates the
+/// argument). A shape that fails to match falls back to the greedy rule and
+/// flags `shape_mismatch` — never an error, never a different document shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ArgShape {
+    /// The universal default: to the next `#` that starts a tag, or EOL.
+    #[default]
+    Greedy,
+    /// A `"..."` string right after the name; `\"` escapes the quote. The
+    /// tag ends at the closing quote and the rest of the line is prose.
+    Quoted,
+    /// One whitespace-delimited word.
+    Word,
+    /// A run of `key=value` pairs (values optionally quoted), ending before
+    /// the first token that is not one.
+    Kv,
+    /// Up to (excluding) the first of `.,;:!?` or EOL.
+    UntilPunct,
+}
+
+impl ArgShape {
+    /// Look up a shape by its config string. Returns `None` for unknown
+    /// words.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "greedy" => Some(Self::Greedy),
+            "quoted" => Some(Self::Quoted),
+            "word" => Some(Self::Word),
+            "kv" => Some(Self::Kv),
+            "until-punct" => Some(Self::UntilPunct),
+            _ => None,
+        }
+    }
+
+    /// The canonical config string.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Greedy => "greedy",
+            Self::Quoted => "quoted",
+            Self::Word => "word",
+            Self::Kv => "kv",
+            Self::UntilPunct => "until-punct",
+        }
+    }
+}
+
+impl std::fmt::Display for ArgShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// The `kind` shorthands: each reuses an existing built-in argument parser.
@@ -99,7 +163,7 @@ pub enum TagTableError {
     DuplicateDeclaration { tag: String },
     /// Both `pattern` and `kind` were given — they are mutually exclusive.
     ConflictingRule { tag: String },
-    /// Neither `pattern` nor `kind` was given.
+    /// None of `pattern`, `kind`, and `shape` was given.
     MissingRule { tag: String },
     /// The `pattern` regex failed to compile.
     InvalidPattern {
@@ -127,7 +191,7 @@ impl std::fmt::Display for TagTableError {
                 )
             }
             Self::MissingRule { tag } => {
-                write!(f, "tag '{tag}': declare either 'pattern' or 'kind'")
+                write!(f, "tag '{tag}': declare 'pattern', 'kind', or 'shape'")
             }
             Self::InvalidPattern { tag, error } => {
                 write!(f, "tag '{tag}': invalid pattern: {error}")
@@ -147,6 +211,14 @@ pub enum CustomRule {
     Kind(CustomArgKind),
 }
 
+/// One compiled declaration: the argument-extent shape plus the optional
+/// interpretation rule.
+#[derive(Debug, Clone)]
+struct CompiledTag {
+    shape: ArgShape,
+    rule: Option<CustomRule>,
+}
+
 /// Compiled user tag declarations, consulted when the parser types a tag
 /// whose name is not a built-in keyword.
 ///
@@ -156,7 +228,7 @@ pub enum CustomRule {
 /// [`parse_document`](crate::parser::parse_document) exactly.
 #[derive(Debug, Clone, Default)]
 pub struct TagTable {
-    rules: HashMap<String, CustomRule>,
+    rules: HashMap<String, CompiledTag>,
 }
 
 impl TagTable {
@@ -183,9 +255,13 @@ impl TagTable {
             }
             let rule = match (decl.pattern, decl.kind) {
                 (Some(_), Some(_)) => return Err(TagTableError::ConflictingRule { tag }),
-                (None, None) => return Err(TagTableError::MissingRule { tag }),
+                // A shape alone is a valid (plain) declaration.
+                (None, None) if decl.shape.is_none() => {
+                    return Err(TagTableError::MissingRule { tag });
+                }
+                (None, None) => None,
                 (Some(pattern), None) => match Regex::new(&pattern) {
-                    Ok(re) => CustomRule::Pattern(re),
+                    Ok(re) => Some(CustomRule::Pattern(re)),
                     Err(error) => {
                         return Err(TagTableError::InvalidPattern {
                             tag,
@@ -193,9 +269,13 @@ impl TagTable {
                         });
                     }
                 },
-                (None, Some(kind)) => CustomRule::Kind(kind),
+                (None, Some(kind)) => Some(CustomRule::Kind(kind)),
             };
-            if rules.insert(tag.clone(), rule).is_some() {
+            let compiled = CompiledTag {
+                shape: decl.shape.unwrap_or_default(),
+                rule,
+            };
+            if rules.insert(tag.clone(), compiled).is_some() {
                 return Err(TagTableError::DuplicateDeclaration { tag });
             }
         }
@@ -213,9 +293,20 @@ impl TagTable {
         self.rules.len()
     }
 
-    /// The compiled rule for `name`, if declared.
+    /// The compiled interpretation rule for `name`. `None` both when `name`
+    /// is not declared and when the declaration is shape-only; distinguish
+    /// with [`TagTable::contains`].
     pub fn get(&self, name: &str) -> Option<&CustomRule> {
-        self.rules.get(name)
+        self.rules.get(name)?.rule.as_ref()
+    }
+
+    /// The declared argument-extent shape for `name`.
+    /// [`ArgShape::Greedy`] for undeclared names — the universal default.
+    pub fn shape(&self, name: &str) -> ArgShape {
+        self.rules
+            .get(name)
+            .map(|c| c.shape)
+            .unwrap_or(ArgShape::Greedy)
     }
 
     /// Whether `name` is declared.
@@ -229,14 +320,15 @@ impl TagTable {
     }
 
     /// The field (column) names `name` can produce: the regex's named capture
-    /// groups in pattern order, or the single kind name. `None` when `name`
-    /// is not declared.
+    /// groups in pattern order, or the single kind name (empty for a
+    /// shape-only declaration). `None` when `name` is not declared.
     pub fn group_names(&self, name: &str) -> Option<Vec<String>> {
-        match self.rules.get(name)? {
-            CustomRule::Pattern(re) => {
+        match &self.rules.get(name)?.rule {
+            Some(CustomRule::Pattern(re)) => {
                 Some(re.capture_names().flatten().map(str::to_string).collect())
             }
-            CustomRule::Kind(kind) => Some(vec![kind.as_str().to_string()]),
+            Some(CustomRule::Kind(kind)) => Some(vec![kind.as_str().to_string()]),
+            None => Some(Vec::new()),
         }
     }
 }
@@ -261,15 +353,15 @@ mod tests {
         TagDeclaration {
             name: name.to_string(),
             pattern: Some(pattern.to_string()),
-            kind: None,
+            ..Default::default()
         }
     }
 
     fn kind_decl(name: &str, kind: CustomArgKind) -> TagDeclaration {
         TagDeclaration {
             name: name.to_string(),
-            pattern: None,
             kind: Some(kind),
+            ..Default::default()
         }
     }
 
@@ -328,6 +420,7 @@ mod tests {
             name: "book".to_string(),
             pattern: Some(".*".to_string()),
             kind: Some(CustomArgKind::Slug),
+            ..Default::default()
         }])
         .unwrap_err();
         assert!(matches!(err, TagTableError::ConflictingRule { ref tag } if tag == "book"));
@@ -337,11 +430,59 @@ mod tests {
     fn test_build_missing_rule() {
         let err = TagTable::build([TagDeclaration {
             name: "book".to_string(),
-            pattern: None,
-            kind: None,
+            ..Default::default()
         }])
         .unwrap_err();
         assert!(matches!(err, TagTableError::MissingRule { ref tag } if tag == "book"));
+    }
+
+    #[test]
+    fn test_build_shape_only_declaration() {
+        // A shape with no interpretation rule is a valid plain declaration.
+        let table = TagTable::build([TagDeclaration {
+            name: "task".to_string(),
+            shape: Some(ArgShape::Quoted),
+            ..Default::default()
+        }])
+        .unwrap();
+        assert!(table.contains("task"));
+        assert_eq!(table.shape("task"), ArgShape::Quoted);
+        assert!(table.get("task").is_none(), "no interpretation rule");
+        assert_eq!(table.group_names("task"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn test_shape_composes_with_rule_and_defaults_to_greedy() {
+        let table = TagTable::build([
+            TagDeclaration {
+                name: "book".to_string(),
+                pattern: Some(r"(?<title>.+)".to_string()),
+                shape: Some(ArgShape::Quoted),
+                ..Default::default()
+            },
+            kind_decl("reading-time", CustomArgKind::Duration),
+        ])
+        .unwrap();
+        assert_eq!(table.shape("book"), ArgShape::Quoted);
+        assert!(matches!(table.get("book"), Some(CustomRule::Pattern(_))));
+        // No shape declared -> greedy; undeclared names -> greedy too.
+        assert_eq!(table.shape("reading-time"), ArgShape::Greedy);
+        assert_eq!(table.shape("nope"), ArgShape::Greedy);
+    }
+
+    #[test]
+    fn test_arg_shape_roundtrip() {
+        for shape in [
+            ArgShape::Greedy,
+            ArgShape::Quoted,
+            ArgShape::Word,
+            ArgShape::Kv,
+            ArgShape::UntilPunct,
+        ] {
+            assert_eq!(ArgShape::from_str(shape.as_str()), Some(shape));
+        }
+        assert_eq!(ArgShape::from_str("regex"), None);
+        assert_eq!(ArgShape::default(), ArgShape::Greedy);
     }
 
     #[test]

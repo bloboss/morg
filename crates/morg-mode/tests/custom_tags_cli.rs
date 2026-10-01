@@ -214,6 +214,40 @@ fn test_invalid_tags_config_warns_and_degrades() {
 }
 
 #[test]
+fn test_lint_warns_on_shape_fallback() {
+    // An extent shape (plan §10.4 T2) that fails at the lexer falls back to
+    // the greedy rule and surfaces through the same shape_mismatch warning.
+    let fixture = Fixture::new(
+        "[tags.task]\nshape = \"quoted\"\n",
+        "intro #task \"well shaped\" prose\n\nintro #task not quoted at all\n",
+    );
+    let out = fixture.run(&["lint", &vault_arg(&fixture)]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("argument does not match the declared pattern for #task"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("0 error(s), 1 warning(s)"), "{stdout}");
+}
+
+#[test]
+fn test_invalid_shape_config_warns_and_degrades() {
+    let fixture = Fixture::new("[tags.task]\nshape = \"regex\"\n", "intro #task whatever\n");
+    let out = fixture.run(&["lint", &vault_arg(&fixture)]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown shape") && stderr.contains("until-punct"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn test_builtin_collision_config_warns() {
     let fixture = Fixture::new(
         "[tags.deadline]\nkind = \"date\"\n",

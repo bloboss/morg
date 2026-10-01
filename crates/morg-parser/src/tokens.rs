@@ -179,6 +179,10 @@ pub enum Token {
     Attribute { key: String, value: String },
     /// Tag argument text (after a tag, before the next tag)
     TagArg(String),
+    /// Zero-width marker emitted right after a `TagArg` whose declared
+    /// extent shape failed to match, so the greedy rule was used instead
+    /// (plan §10.4 T2). The parser turns it into `shape_mismatch`.
+    ShapeFallback,
 
     // ---- Raw content ----
     /// A line of raw text inside a code block or HTML block
