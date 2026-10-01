@@ -13,6 +13,7 @@ pub mod purchases;
 pub mod refile;
 pub mod refs;
 pub mod search;
+pub mod tags;
 pub mod tangle;
 pub mod time;
 pub mod todos;

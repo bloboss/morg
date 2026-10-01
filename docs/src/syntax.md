@@ -29,6 +29,33 @@ Some text #todo fix this before #deadline 2026-04-15
 
 Use `\#` for a literal hash: `Price is \#100`.
 
+### User-defined tags
+
+Custom tags lex like any unknown tag (name plus greedy argument); a `[tags]`
+section in the config gives them *interpretation* on top, without changing
+how any document parses:
+
+```toml
+[tags.book]
+pattern = '"(?<title>[^"]+)"\s+by\s+(?<author>.+)'   # named capture groups
+
+[tags.reading-time]
+kind = "duration"      # duration | date | timestamp | slug
+```
+
+Each declaration carries exactly one rule. A `pattern` is a regex (the
+`regex` crate: no lookaround, no catastrophic backtracking) whose named
+capture groups become the tag's fields. A `kind` reuses a built-in argument
+parser — `duration` (`#effort`-style `1h30m`), `date` / `timestamp`
+(`#deadline`-style), or `slug` (`#anchor`-style) — and yields one field named
+after the kind holding the value's canonical rendering. Built-in tag names
+cannot be redefined.
+
+Interpretation is lenient: an argument that does not match the declared
+shape leaves the document untouched and only flags the tag, which `morg
+lint` reports as a warning. `morg tags <name>` tabulates every occurrence
+of a declared tag with one column per field.
+
 ## Media
 
 The `#media` tag records books, movies, music, games, and similar items so

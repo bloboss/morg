@@ -130,6 +130,13 @@ pub enum Command {
         /// Markdown files or directories to lint
         files: Vec<PathBuf>,
     },
+    /// Tabulate occurrences of a custom tag declared in the [tags] config
+    Tags {
+        /// Custom tag name (without the leading #), as declared under [tags]
+        name: String,
+        /// Markdown files or directories to process
+        files: Vec<PathBuf>,
+    },
     /// Move a heading subtree to another file/location
     Refile {
         /// Source: file:line or file::heading-text

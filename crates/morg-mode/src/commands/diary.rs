@@ -314,6 +314,7 @@ mod tests {
                 carry_todos: true,
             },
             capture: crate::config::CaptureConfig::default(),
+            tags: Default::default(),
         }
     }
 

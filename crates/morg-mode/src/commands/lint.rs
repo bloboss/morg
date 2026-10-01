@@ -1,13 +1,18 @@
 use std::path::PathBuf;
 
 use morg_parser::ast::*;
+use morg_parser::tag_table::TagTable;
 use morg_parser::tags::TagKind;
 
 use crate::collect;
 use crate::report;
 
-pub fn run(paths: &[PathBuf], json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = collect::parse_files(paths);
+pub fn run(
+    paths: &[PathBuf],
+    json: bool,
+    table: &TagTable,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = collect::parse_files_with(paths, table);
     let mut warnings: Vec<LintWarning> = Vec::new();
 
     for pf in &parsed {
@@ -210,6 +215,17 @@ fn lint_tag(tag: &morg_parser::tags::Tag, file: &std::path::Path, warnings: &mut
                     message: format!("past date: {date}"),
                 });
             }
+        }
+        TagKind::Custom {
+            name,
+            shape_mismatch: true,
+            ..
+        } => {
+            warnings.push(LintWarning {
+                location: report::format_location(file, &tag.span),
+                severity: "warn",
+                message: format!("argument does not match the declared pattern for #{name}"),
+            });
         }
         _ => {}
     }

@@ -1,6 +1,7 @@
 use chrono::{NaiveDate, NaiveDateTime};
 
 use crate::span::Span;
+use crate::tag_table::{CustomArgKind, CustomRule, TagTable};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tag {
@@ -76,10 +77,37 @@ pub enum TagKind {
         is_done: bool,
         text: Option<String>,
     },
+    /// A tag declared in a [`TagTable`] (user-defined interpretation,
+    /// plan §10 T1). Lexes exactly like an unknown tag; the declared rule
+    /// imposes structure on the captured argument.
+    Custom {
+        name: String,
+        /// The raw argument text, like [`TagKind::Unknown`]'s `value`.
+        raw: Option<String>,
+        /// Extracted fields: one per participating named capture group, or
+        /// one field named after the `kind` shorthand. Empty on mismatch.
+        fields: Vec<CustomField>,
+        /// True when the declared pattern/kind did not match the argument.
+        /// Never a parse error — the document's shape is unchanged.
+        shape_mismatch: bool,
+    },
     Unknown {
         name: String,
         value: Option<String>,
     },
+}
+
+/// One extracted field of a [`TagKind::Custom`] tag.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomField {
+    /// The named capture group (or `kind` shorthand) that produced the field.
+    pub group: String,
+    /// The matched text — for pattern groups, exactly the source slice at
+    /// `span`; for `kind` shorthands, the parsed value's canonical rendering.
+    pub value: String,
+    /// Absolute byte span of the match in the parsed source (same
+    /// conventions as every other span in this crate).
+    pub span: Span,
 }
 
 /// A timestamp that may be date-only or date+time.
@@ -375,9 +403,39 @@ impl std::fmt::Display for Money {
 /// Parse a tag from its name and optional argument.
 ///
 /// Keyword resolution is driven by [`Keyword::from_str`] from `tokens.rs`,
-/// which is the single source of truth for all known tag names.
+/// which is the single source of truth for all known tag names. Equivalent
+/// to [`parse_tag_with`] with an empty [`TagTable`].
 pub fn parse_tag(name: &str, arg: Option<&str>, span: Span) -> Tag {
+    parse_tag_with(name, arg, None, span, &TagTable::empty())
+}
+
+/// Parse a tag, consulting `table` for user-declared custom tags.
+///
+/// `raw_arg`, when available, is the argument's raw source text together
+/// with its absolute span (the trimmed `TagArg` byte range). Custom-tag
+/// patterns match against this raw text so that extracted field spans slice
+/// the source exactly; without it (e.g. metadata tags, which never carry an
+/// argument) matching falls back to `arg` with a degenerate span at the end
+/// of the tag.
+pub fn parse_tag_with(
+    name: &str,
+    arg: Option<&str>,
+    raw_arg: Option<(&str, Span)>,
+    span: Span,
+    table: &TagTable,
+) -> Tag {
     use crate::tokens::Keyword;
+
+    // Built-in names can never be declared in a table (build error), so
+    // custom resolution happens only for names the keyword set doesn't know.
+    if Keyword::from_str(name).is_none()
+        && let Some(rule) = table.get(name)
+    {
+        return Tag {
+            kind: custom_tag_kind(name, rule, arg, raw_arg, span),
+            span,
+        };
+    }
 
     let kind = match Keyword::from_str(name) {
         Some(Keyword::Todo) => TagKind::Todo {
@@ -466,6 +524,118 @@ fn unknown(name: &str, arg: Option<&str>) -> TagKind {
         name: name.to_string(),
         value: non_empty(arg),
     }
+}
+
+// ---------------------------------------------------------------------------
+// User-defined (custom) tags
+// ---------------------------------------------------------------------------
+
+/// Resolve a declared custom tag against its rule. Total: a non-matching
+/// argument yields `shape_mismatch: true` with empty fields, never an error.
+fn custom_tag_kind(
+    name: &str,
+    rule: &CustomRule,
+    arg: Option<&str>,
+    raw_arg: Option<(&str, Span)>,
+    span: Span,
+) -> TagKind {
+    // The text patterns match against, and the span to map field offsets
+    // through. Prefer the raw source slice (span-exact); fall back to the
+    // processed argument anchored degenerately at the tag's end.
+    let (text, base) = match raw_arg {
+        Some((raw, raw_span)) => (raw, raw_span),
+        None => (
+            arg.unwrap_or(""),
+            Span::new(span.end, span.end, span.line, span.col),
+        ),
+    };
+
+    let fields = match rule {
+        CustomRule::Pattern(re) => re.captures(text).map(|caps| {
+            re.capture_names()
+                .flatten()
+                .filter_map(|group| {
+                    let m = caps.name(group)?;
+                    Some(CustomField {
+                        group: group.to_string(),
+                        value: m.as_str().to_string(),
+                        span: offset_span(base, text, m.start(), m.end()),
+                    })
+                })
+                .collect::<Vec<_>>()
+        }),
+        CustomRule::Kind(kind) => custom_kind_canonical(*kind, text).map(|canonical| {
+            vec![CustomField {
+                group: kind.as_str().to_string(),
+                value: canonical,
+                span: base,
+            }]
+        }),
+    };
+
+    let (fields, shape_mismatch) = match fields {
+        Some(fields) => (fields, false),
+        None => (Vec::new(), true),
+    };
+
+    TagKind::Custom {
+        name: name.to_string(),
+        raw: non_empty(arg.or(raw_arg.map(|(raw, _)| raw))),
+        fields,
+        shape_mismatch,
+    }
+}
+
+/// Run the built-in argument parser behind a `kind` shorthand, returning the
+/// parsed value's canonical rendering. `None` means the argument does not
+/// have the declared shape.
+fn custom_kind_canonical(kind: CustomArgKind, text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    match kind {
+        // Same parser as #effort / #clock durations.
+        CustomArgKind::Duration => parse_duration(text).map(format_duration),
+        // Same parser as #deadline / #scheduled; date keeps the date
+        // component, timestamp keeps the time when present.
+        CustomArgKind::Date => {
+            parse_timestamp_full(Some(text)).map(|(ts, _, _)| ts.date().to_string())
+        }
+        CustomArgKind::Timestamp => {
+            parse_timestamp_full(Some(text)).map(|(ts, _, _)| ts.to_string())
+        }
+        // Same parser as #anchor.
+        CustomArgKind::Slug => parse_anchor(Some(text)),
+    }
+}
+
+/// Canonical rendering for a duration in minutes: `2h`, `45m`, `1h30m`.
+fn format_duration(minutes: u64) -> String {
+    let hours = minutes / 60;
+    let mins = minutes % 60;
+    if hours > 0 && mins > 0 {
+        format!("{hours}h{mins}m")
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else {
+        format!("{mins}m")
+    }
+}
+
+/// Absolute span for `text[start..end]`, where `base` locates `text` in the
+/// source. Byte offsets simply shift; line/col account for newlines inside
+/// `text` (greedy arguments can cross lines in multi-line paragraphs).
+fn offset_span(base: Span, text: &str, start: usize, end: usize) -> Span {
+    let prefix = &text[..start];
+    let (line, col) = match prefix.rfind('\n') {
+        Some(last_nl) => (
+            base.line + prefix.matches('\n').count() as u32,
+            (start - last_nl - 1) as u32 + 1,
+        ),
+        None => (base.line, base.col + start as u32),
+    };
+    Span::new(base.start + start, base.start + end, line, col)
 }
 
 fn non_empty(s: Option<&str>) -> Option<String> {
@@ -1183,6 +1353,7 @@ mod tests {
         assert!(matches!(tag.kind, TagKind::Unknown { ref name, .. } if name == "media"));
     }
 
+    #[test]
     fn test_parse_purchase_currency_symbol() {
         let tag = parse_tag(
             "purchase",
