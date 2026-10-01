@@ -1353,6 +1353,7 @@ mod tests {
         assert!(matches!(tag.kind, TagKind::Unknown { ref name, .. } if name == "media"));
     }
 
+    #[test]
     fn test_parse_purchase_currency_symbol() {
         let tag = parse_tag(
             "purchase",
