@@ -230,6 +230,17 @@ fn render_inline_segment(seg: &InlineSegment, out: &mut String) {
                 "<sup><a id=\"fnref-{label}\" href=\"#fn-{label}\">{label}</a></sup>"
             ));
         }
+        InlineKind::Cite { key, locator } => {
+            let text = match locator {
+                Some(loc) => format!("[@{key}, {loc}]"),
+                None => format!("[@{key}]"),
+            };
+            out.push_str(&format!(
+                "<span class=\"cite\" data-cite-key=\"{}\">{}</span>",
+                escape_html(key),
+                escape_html(&text),
+            ));
+        }
     }
 }
 

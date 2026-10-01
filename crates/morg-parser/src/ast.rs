@@ -186,6 +186,15 @@ fn plain_text_segments(segments: &[InlineSegment], out: &mut String) {
                 out.push_str(label);
                 out.push(']');
             }
+            InlineKind::Cite { key, locator } => {
+                out.push_str("[@");
+                out.push_str(key);
+                if let Some(loc) = locator {
+                    out.push_str(", ");
+                    out.push_str(loc);
+                }
+                out.push(']');
+            }
         }
     }
 }
@@ -204,7 +213,10 @@ fn collect_tags_from_segments<'a>(segments: &'a [InlineSegment], out: &mut Vec<&
                     out.push(t);
                 }
             }
-            InlineKind::Text(_) | InlineKind::Code(_) | InlineKind::FootnoteRef(_) => {}
+            InlineKind::Text(_)
+            | InlineKind::Code(_)
+            | InlineKind::FootnoteRef(_)
+            | InlineKind::Cite { .. } => {}
         }
     }
 }
@@ -239,6 +251,11 @@ pub enum InlineKind {
     Code(String),
     Link(Link),
     FootnoteRef(String),
+    /// A Pandoc-style citation: `[@key]` or `[@key, p. 4]`.
+    Cite {
+        key: String,
+        locator: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -988,6 +988,16 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent 
                 push(InlineKind::FootnoteRef(label.clone()), tok_span);
                 i += 1;
             }
+            Token::Cite { key, locator } => {
+                push(
+                    InlineKind::Cite {
+                        key: key.clone(),
+                        locator: locator.clone(),
+                    },
+                    tok_span,
+                );
+                i += 1;
+            }
             Token::Tag(kw) => {
                 let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
                 let tag = tags::parse_tag(kw.as_str(), arg, span);
@@ -1552,6 +1562,78 @@ mod tests {
         assert_eq!(slice(src, &segs[1].span), "`code`");
         assert_eq!(slice(src, &segs[3].span), "[^1]");
         assert!(matches!(segs[3].kind, InlineKind::FootnoteRef(_)));
+    }
+
+    #[test]
+    fn test_cite_segment_in_paragraph() {
+        let src = "Evidence from [@paszke_pytorch_2019] and [@martin_adapting_2021-1, p. 4].\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let cites: Vec<_> = para
+            .content
+            .segments
+            .iter()
+            .filter(|s| matches!(s.kind, InlineKind::Cite { .. }))
+            .collect();
+        assert_eq!(cites.len(), 2, "segments: {:#?}", para.content.segments);
+
+        assert!(matches!(
+            &cites[0].kind,
+            InlineKind::Cite { key, locator: None } if key == "paszke_pytorch_2019"
+        ));
+        assert_eq!(slice(src, &cites[0].span), "[@paszke_pytorch_2019]");
+
+        assert!(matches!(
+            &cites[1].kind,
+            InlineKind::Cite { key, locator: Some(loc) }
+                if key == "martin_adapting_2021-1" && loc == "p. 4"
+        ));
+        assert_eq!(
+            slice(src, &cites[1].span),
+            "[@martin_adapting_2021-1, p. 4]"
+        );
+    }
+
+    #[test]
+    fn test_cite_segment_multibyte_spans() {
+        // Multi-byte text around the cite; the paragraph sits on line 3.
+        let src = "# Título\n\ncafé [@key_2020, § 2–3] après\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let cite = para
+            .content
+            .segments
+            .iter()
+            .find(|s| matches!(s.kind, InlineKind::Cite { .. }))
+            .expect("should have a cite segment");
+        assert_eq!(slice(src, &cite.span), "[@key_2020, § 2–3]");
+        assert_eq!(cite.span.line, 3);
+        // "café " is 6 bytes, so the cite starts at byte column 7.
+        assert_eq!(cite.span.col, 7);
+        assert!(matches!(
+            &cite.kind,
+            InlineKind::Cite { key, locator: Some(loc) } if key == "key_2020" && loc == "§ 2–3"
+        ));
+    }
+
+    #[test]
+    fn test_cite_plain_text_fallbacks_parse_as_text() {
+        let src = "bad [@] and [@unclosed\n";
+        let result = parse_document(src);
+        let para = first_paragraph(&result);
+        assert!(
+            para.content
+                .segments
+                .iter()
+                .all(|s| !matches!(s.kind, InlineKind::Cite { .. })),
+            "no cite expected: {:#?}",
+            para.content.segments
+        );
+        assert_eq!(para.content.plain_text(), "bad [@] and [@unclosed");
     }
 
     #[test]

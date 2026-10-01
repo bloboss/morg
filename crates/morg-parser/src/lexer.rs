@@ -507,6 +507,20 @@ fn tokenize_inline_into(text: &str, base: Span, out: &mut Vec<Spanned>) {
             continue;
         }
 
+        // Citation [@key] or [@key, locator]
+        if ch == b'['
+            && peek(bytes, i + 1) == Some(b'@')
+            && let Some((key, locator, end)) = try_cite(text, i)
+        {
+            flush(&mut current_text, run_start, i, &mut tracker, out);
+            out.push(Spanned {
+                kind: Token::Cite { key, locator },
+                span: tracker.span(i, end),
+            });
+            i = end;
+            continue;
+        }
+
         // Link [text](url ...)
         if ch == b'['
             && let Some((link_tok, end)) = try_link(text, i)
@@ -719,6 +733,59 @@ fn try_footnote_ref(text: &str, start: usize) -> Option<(String, usize)> {
         return None;
     }
     Some((label.to_string(), start + 2 + end + 1))
+}
+
+/// Scan a Pandoc-style citation `[@key]` / `[@key, locator]` whose `[` sits
+/// at byte `start`. Returns the key, the optional locator (trimmed, `None`
+/// when empty), and the byte index just past the closing `]`.
+///
+/// Returns `None` — so the caller falls through to link parsing or plain
+/// text — when the key is empty or malformed, the bracket never closes on
+/// this inline run, unexpected content follows the key, or the citation is
+/// immediately followed by `(` (link syntax `[text](url)` takes precedence).
+fn try_cite(text: &str, start: usize) -> Option<(String, Option<String>, usize)> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'[') || bytes.get(start + 1) != Some(&b'@') {
+        return None;
+    }
+
+    // Key: ASCII alphanumerics plus `_`, with `-` allowed after the first
+    // char (trailing disambiguation suffixes like `-1`).
+    let key_start = start + 2;
+    let first = *bytes.get(key_start)?;
+    if !first.is_ascii_alphanumeric() && first != b'_' {
+        return None;
+    }
+    let mut pos = key_start + 1;
+    while pos < bytes.len()
+        && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_' || bytes[pos] == b'-')
+    {
+        pos += 1;
+    }
+    let key_end = pos;
+
+    // Optional locator after a comma; `]` must close on this inline run.
+    let locator = match bytes.get(pos)? {
+        b']' => None,
+        b',' => {
+            let loc_start = pos + 1;
+            let close = text[loc_start..].find(']')? + loc_start;
+            pos = close;
+            let loc = text[loc_start..close].trim();
+            if loc.is_empty() {
+                None
+            } else {
+                Some(loc.to_string())
+            }
+        }
+        _ => return None,
+    };
+
+    let end = pos + 1; // past the `]`
+    if peek(bytes, end) == Some(b'(') {
+        return None; // `[@key](url)` is a link, not a citation
+    }
+    Some((text[key_start..key_end].to_string(), locator, end))
 }
 
 fn try_link(text: &str, start: usize) -> Option<(Token, usize)> {
@@ -1097,6 +1164,96 @@ mod tests {
         assert!(matches!(&tokens[0], Token::Text(t) if t == "text"));
         assert!(matches!(&tokens[1], Token::FootnoteRef { label } if label == "1"));
         assert!(matches!(&tokens[2], Token::Text(t) if t == " more"));
+    }
+
+    #[test]
+    fn test_inline_cite_simple() {
+        let tokens = inline_tokens("see [@paszke_pytorch_2019] for details");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "see "));
+        assert!(matches!(
+            &tokens[1],
+            Token::Cite { key, locator: None } if key == "paszke_pytorch_2019"
+        ));
+        assert!(matches!(&tokens[2], Token::Text(t) if t == " for details"));
+    }
+
+    #[test]
+    fn test_inline_cite_with_locator() {
+        let tokens = inline_tokens("[@martin_adapting_2021-1, p. 4]");
+        assert!(matches!(
+            &tokens[0],
+            Token::Cite { key, locator: Some(loc) }
+                if key == "martin_adapting_2021-1" && loc == "p. 4"
+        ));
+    }
+
+    #[test]
+    fn test_inline_cite_empty_locator_is_none() {
+        let tokens = inline_tokens("[@key, ]");
+        assert!(matches!(
+            &tokens[0],
+            Token::Cite { key, locator: None } if key == "key"
+        ));
+    }
+
+    #[test]
+    fn test_inline_cite_fallback_to_text() {
+        // Empty key
+        let tokens = inline_tokens("[@] nothing");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "[@] nothing"));
+
+        // Unclosed bracket
+        let tokens = inline_tokens("see [@dangling_2020");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "see [@dangling_2020"));
+
+        // Content after the key that is not `,` or `]`
+        let tokens = inline_tokens("[@key extra]");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "[@key extra]"));
+
+        // Unclosed after locator comma
+        let tokens = inline_tokens("[@key, p. 4");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "[@key, p. 4"));
+    }
+
+    #[test]
+    fn test_inline_cite_not_confused_with_link_or_footnote() {
+        // `[@key](url)` is a link whose text happens to start with @
+        let tokens = inline_tokens("[@key](https://example.com)");
+        assert!(matches!(&tokens[0], Token::Link { text, .. } if text == "@key"));
+
+        // Footnotes keep working
+        let tokens = inline_tokens("x[^1] and [@real_key_2024]");
+        assert!(matches!(&tokens[1], Token::FootnoteRef { label } if label == "1"));
+        assert!(matches!(&tokens[3], Token::Cite { key, .. } if key == "real_key_2024"));
+    }
+
+    #[test]
+    fn test_inline_cite_spans_slice_source_multibyte() {
+        // Multi-byte chars before the cite and inside the locator; slicing
+        // the source with the token span must yield the exact citation text.
+        let src = "αβ [@kohler_2019, p. 4–5] fin";
+        let spanned = tokenize_inline(src, Span::new(0, src.len(), 1, 1));
+        let cite = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::Cite { .. }))
+            .expect("should lex a cite");
+        assert_eq!(
+            &src[cite.span.start..cite.span.end],
+            "[@kohler_2019, p. 4–5]"
+        );
+        assert!(matches!(
+            &cite.kind,
+            Token::Cite { key, locator: Some(loc) } if key == "kohler_2019" && loc == "p. 4–5"
+        ));
+    }
+
+    #[test]
+    fn test_inline_cite_non_ascii_key_falls_back() {
+        // 'ö' is outside the key charset (ASCII alphanumerics, `_`, `-`),
+        // so this is not a citation; the whole run stays plain text.
+        let src = "[@köhler_2019] text";
+        let tokens = inline_tokens(src);
+        assert!(matches!(&tokens[0], Token::Text(t) if t == src));
     }
 
     #[test]
