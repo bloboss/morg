@@ -6,8 +6,14 @@
 //! 2. **Inline tokenizer** (`tokenize_inline`) is called by the parser on demand to break
 //!    raw text into inline tokens (bold, italic, tags, links, etc.). This is never called
 //!    eagerly — the parser controls when inline parsing happens.
+//!
+//! The inline tokenizer consults a [`TagTable`] for user-declared argument
+//! extent shapes (plan §10.4 T2) via [`tokenize_inline_with`]; the block
+//! tokenizer never does — block-level tag arguments are always the rest of
+//! the line, whatever the shape.
 
 use crate::span::Span;
+use crate::tag_table::{ArgShape, TagTable};
 use crate::tokens::{Keyword, Spanned, Token};
 
 // ===========================================================================
@@ -352,9 +358,22 @@ fn classify_line(text: &str, span: Span, out: &mut Vec<Spanned>) {
 /// byte offsets into the source file and whose `line`/`col` locate the
 /// token's first byte (newlines inside `text` are tracked, so multi-line
 /// paragraphs get per-line positions).
+///
+/// Equivalent to [`tokenize_inline_with`] with an empty [`TagTable`]: every
+/// tag argument uses the greedy extent rule.
 pub fn tokenize_inline(text: &str, base: Span) -> Vec<Spanned> {
+    tokenize_inline_with(text, base, &TagTable::empty())
+}
+
+/// [`tokenize_inline`], additionally consulting `table` for user-declared
+/// argument extent shapes. A tag whose declared shape matches at the lex
+/// position gets that extent; a shape that fails to match falls back to the
+/// greedy rule and a zero-width [`Token::ShapeFallback`] marker follows the
+/// `TagArg` — never an error. Built-in keywords and undeclared tags always
+/// use the greedy rule.
+pub fn tokenize_inline_with(text: &str, base: Span, table: &TagTable) -> Vec<Spanned> {
     let mut out = Vec::new();
-    tokenize_inline_into(text, base, &mut out);
+    tokenize_inline_into(text, base, table, &mut out);
     out
 }
 
@@ -402,7 +421,7 @@ impl<'t> SpanTracker<'t> {
     }
 }
 
-fn tokenize_inline_into(text: &str, base: Span, out: &mut Vec<Spanned>) {
+fn tokenize_inline_into(text: &str, base: Span, table: &TagTable, out: &mut Vec<Spanned>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut current_text = String::new();
@@ -540,7 +559,7 @@ fn tokenize_inline_into(text: &str, base: Span, out: &mut Vec<Spanned>) {
                 && (next.is_alphanumeric() || next == '_')
             {
                 flush(&mut current_text, run_start, i, &mut tracker, out);
-                let tag = tokenize_tag(text, i + 1);
+                let tag = tokenize_tag(text, i + 1, table);
                 out.push(Spanned {
                     kind: tag.token,
                     span: tracker.span(i, tag.name_end),
@@ -550,6 +569,12 @@ fn tokenize_inline_into(text: &str, base: Span, out: &mut Vec<Spanned>) {
                         kind: arg_tok,
                         span: tracker.span(arg_start, arg_end),
                     });
+                    if tag.shape_fallback {
+                        out.push(Spanned {
+                            kind: Token::ShapeFallback,
+                            span: tracker.span(tag.end, tag.end),
+                        });
+                    }
                 }
                 i = tag.end;
                 continue;
@@ -901,11 +926,15 @@ struct ScannedTag {
     arg: Option<(Token, usize, usize)>,
     /// Byte index just past everything consumed by this tag.
     end: usize,
+    /// True when a declared non-greedy shape failed to match and the greedy
+    /// rule produced the argument instead.
+    shape_fallback: bool,
 }
 
 /// Scan a tag starting at `name_start` (the byte after `#`; the `#` itself is
-/// at `name_start - 1`).
-fn tokenize_tag(text: &str, name_start: usize) -> ScannedTag {
+/// at `name_start - 1`). `table` supplies declared argument extent shapes;
+/// built-in keywords and undeclared names always use the greedy rule.
+fn tokenize_tag(text: &str, name_start: usize, table: &TagTable) -> ScannedTag {
     let bytes = text.as_bytes();
     let mut pos = name_start;
 
@@ -919,12 +948,45 @@ fn tokenize_tag(text: &str, name_start: usize) -> ScannedTag {
 
     let name_end = pos;
     let name = &text[name_start..name_end];
-    let tok = match Keyword::from_str(name) {
+    let keyword = Keyword::from_str(name);
+    let tok = match keyword {
         Some(kw) => Token::Tag(kw),
         None => Token::UnknownTag {
             name: name.to_string(),
         },
     };
+
+    // Declared non-greedy shape (custom tags only): try it at the position
+    // after the name's separating space. A match decides the extent; a
+    // failure falls back to greedy below with the fallback flag raised.
+    let shape = match keyword {
+        Some(_) => ArgShape::Greedy,
+        None => table.shape(name),
+    };
+    let mut shape_failed = false;
+    if shape != ArgShape::Greedy && pos < bytes.len() && bytes[pos] == b' ' {
+        let mut p = pos + 1;
+        while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+            p += 1;
+        }
+        match scan_shape(shape, text, p) {
+            Some(m) => {
+                let arg = if m.value.is_empty() {
+                    None
+                } else {
+                    Some((Token::TagArg(m.value), m.raw_start, m.raw_end))
+                };
+                return ScannedTag {
+                    token: tok,
+                    name_end,
+                    arg,
+                    end: m.end,
+                    shape_fallback: false,
+                };
+            }
+            None => shape_failed = true,
+        }
+    }
 
     let mut arg = String::new();
     let arg_scan_start = if pos < bytes.len() && bytes[pos] == b' ' {
@@ -973,12 +1035,210 @@ fn tokenize_tag(text: &str, name_start: usize) -> ScannedTag {
         }
     };
 
+    // A failed shape only counts as a fallback when the greedy rule actually
+    // captured an argument; a bare tag is not a mismatch.
+    let shape_fallback = shape_failed && arg_tok.is_some();
+
     ScannedTag {
         token: tok,
         name_end,
         arg: arg_tok,
         end: pos,
+        shape_fallback,
     }
+}
+
+// ===========================================================================
+// Argument extent shapes (plan §10.4 T2)
+// ===========================================================================
+
+/// A successful shape match at an inline lex position.
+pub(crate) struct ShapeMatch {
+    /// The captured argument. For `quoted` this is the unescaped inner text
+    /// (`\"` → `"`, `\\` → `\`); for every other shape the raw source slice.
+    pub value: String,
+    /// Byte range of the capture's raw text (for `quoted`: the inner text
+    /// between the quotes, escapes still visible).
+    pub raw_start: usize,
+    pub raw_end: usize,
+    /// Byte index just past everything the shape consumed (for `quoted`:
+    /// past the closing quote).
+    pub end: usize,
+}
+
+/// Match `shape` against `text` starting at `p` (first non-space byte after
+/// the tag name). Shapes are bounded by the end of the line: a `\n` never
+/// belongs to a shaped argument. `None` means the shape does not match here
+/// and the caller must fall back to the greedy rule.
+pub(crate) fn scan_shape(shape: ArgShape, text: &str, p: usize) -> Option<ShapeMatch> {
+    match shape {
+        ArgShape::Greedy => None, // greedy is the fallback, not a shape match
+        ArgShape::Quoted => scan_quoted(text, p),
+        ArgShape::Word => scan_word(text, p),
+        ArgShape::Kv => scan_kv(text, p),
+        ArgShape::UntilPunct => scan_until_punct(text, p),
+    }
+}
+
+/// Match `shape` against the whole of `raw` (a block-level tag argument,
+/// already trimmed). Block tags keep their whole-line extent regardless of
+/// shape, so here the shape only validates/structures: the match must start
+/// at byte 0 and consume all of `raw`. Returns the captured value plus the
+/// byte range of its raw text within `raw`.
+pub(crate) fn match_shape_exact(shape: ArgShape, raw: &str) -> Option<(String, usize, usize)> {
+    let m = scan_shape(shape, raw, 0)?;
+    if m.end == raw.len() {
+        Some((m.value, m.raw_start, m.raw_end))
+    } else {
+        None
+    }
+}
+
+/// Whether the `#` at byte `i` starts a tag (next char alphanumeric or `_`).
+fn starts_tag(text: &str, i: usize) -> bool {
+    debug_assert_eq!(text.as_bytes().get(i), Some(&b'#'));
+    matches!(text[i + 1..].chars().next(), Some(c) if c.is_alphanumeric() || c == '_')
+}
+
+/// `quoted`: a `"..."` string. Backslash escapes the next char: `\"` and
+/// `\\` unescape in the value, any other pair is kept verbatim. The closing
+/// quote must appear before the end of the line.
+fn scan_quoted(text: &str, p: usize) -> Option<ShapeMatch> {
+    let bytes = text.as_bytes();
+    if bytes.get(p) != Some(&b'"') {
+        return None;
+    }
+    let mut i = p + 1;
+    let mut value = String::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => return None,
+            b'"' => {
+                return Some(ShapeMatch {
+                    value,
+                    raw_start: p + 1,
+                    raw_end: i,
+                    end: i + 1,
+                });
+            }
+            b'\\' if i + 1 < bytes.len() && bytes[i + 1] != b'\n' => {
+                let c = text[i + 1..].chars().next().unwrap();
+                if c != '"' && c != '\\' {
+                    value.push('\\');
+                }
+                value.push(c);
+                i += 1 + c.len_utf8();
+            }
+            _ => {
+                let c = text[i..].chars().next().unwrap();
+                value.push(c);
+                i += c.len_utf8();
+            }
+        }
+    }
+    None
+}
+
+/// `word`: one whitespace-delimited word. Like the greedy rule, a `#` that
+/// starts a tag also ends the word.
+fn scan_word(text: &str, p: usize) -> Option<ShapeMatch> {
+    let mut i = p;
+    for c in text[p..].chars() {
+        if c.is_whitespace() || (c == '#' && starts_tag(text, i)) {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    (i > p).then(|| ShapeMatch {
+        value: text[p..i].to_string(),
+        raw_start: p,
+        raw_end: i,
+        end: i,
+    })
+}
+
+/// `kv`: a run of `key=value` pairs. Keys use the tag-name charset
+/// (alphanumerics, `-`, `_`); values are quoted strings or unquoted runs
+/// ending at whitespace, EOL, or a `#` that starts a tag. The run ends
+/// before the first token that is not a pair; at least one pair must match.
+/// The captured value is the raw source slice, verbatim.
+fn scan_kv(text: &str, p: usize) -> Option<ShapeMatch> {
+    let bytes = text.as_bytes();
+    let mut i = p;
+    let mut last_end = p;
+    let mut pairs = 0usize;
+
+    loop {
+        // Key: at least one tag-name char, then `=`.
+        let key_start = i;
+        let mut k = i;
+        for c in text[i..].chars() {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                k += c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if k == key_start || bytes.get(k) != Some(&b'=') {
+            break;
+        }
+        // Value: quoted (must close before EOL) or unquoted non-empty run.
+        let mut v = k + 1;
+        if bytes.get(v) == Some(&b'"') {
+            let Some(m) = scan_quoted(text, v) else {
+                break;
+            };
+            v = m.end;
+        } else {
+            let v_start = v;
+            for c in text[v..].chars() {
+                if c.is_whitespace() || (c == '#' && starts_tag(text, v)) {
+                    break;
+                }
+                v += c.len_utf8();
+            }
+            if v == v_start {
+                break;
+            }
+        }
+        pairs += 1;
+        last_end = v;
+        // Pairs are separated by spaces/tabs; anything else ends the run.
+        i = v;
+        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i == v {
+            break;
+        }
+    }
+
+    (pairs > 0).then(|| ShapeMatch {
+        value: text[p..last_end].to_string(),
+        raw_start: p,
+        raw_end: last_end,
+        end: last_end,
+    })
+}
+
+/// `until-punct`: up to (excluding) the first of `.,;:!?` or EOL, with
+/// trailing whitespace trimmed. The punctuation itself returns to normal
+/// inline tokenization.
+fn scan_until_punct(text: &str, p: usize) -> Option<ShapeMatch> {
+    let mut i = p;
+    for c in text[p..].chars() {
+        if c == '\n' || matches!(c, '.' | ',' | ';' | ':' | '!' | '?') {
+            break;
+        }
+        i += c.len_utf8();
+    }
+    let trimmed_len = text[p..i].trim_end().len();
+    (trimmed_len > 0).then(|| ShapeMatch {
+        value: text[p..p + trimmed_len].to_string(),
+        raw_start: p,
+        raw_end: p + trimmed_len,
+        end: p + trimmed_len,
+    })
 }
 
 // ===========================================================================
@@ -1292,5 +1552,195 @@ mod tests {
     fn test_inline_escaped_hash() {
         let tokens = inline_tokens(r"price \#100");
         assert!(matches!(&tokens[0], Token::Text(t) if t == "price #100"));
+    }
+
+    // Argument extent shapes (plan §10.4 T2)
+
+    use crate::tag_table::TagDeclaration;
+
+    fn shape_table(name: &str, shape: ArgShape) -> TagTable {
+        TagTable::build([TagDeclaration {
+            name: name.to_string(),
+            shape: Some(shape),
+            ..Default::default()
+        }])
+        .unwrap()
+    }
+
+    fn shaped_tokens(text: &str, table: &TagTable) -> Vec<Token> {
+        tokenize_inline_with(text, Span::empty(1, 1), table)
+            .into_iter()
+            .map(|s| s.kind)
+            .collect()
+    }
+
+    fn shaped_spanned(text: &str, table: &TagTable) -> Vec<Spanned> {
+        tokenize_inline_with(text, Span::new(0, text.len(), 1, 1), table)
+    }
+
+    #[test]
+    fn test_shape_quoted_ends_at_quote_and_prose_resumes() {
+        let table = shape_table("task", ArgShape::Quoted);
+        let tokens = shaped_tokens("see #task \"fix this\" and more prose", &table);
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "see "));
+        assert!(matches!(&tokens[1], Token::UnknownTag { name } if name == "task"));
+        assert!(matches!(&tokens[2], Token::TagArg(a) if a == "fix this"));
+        // The rest of the line is prose again — the feature's whole point.
+        assert!(matches!(&tokens[3], Token::Text(t) if t == " and more prose"));
+        assert_eq!(tokens.len(), 4);
+    }
+
+    #[test]
+    fn test_shape_quoted_escapes_and_spans() {
+        let table = shape_table("task", ArgShape::Quoted);
+        let src = r#"#task "say \"hi\" now" rest"#;
+        let spanned = shaped_spanned(src, &table);
+        let arg = &spanned[1];
+        // Value is unescaped; the span slices the raw inner text exactly.
+        assert!(matches!(&arg.kind, Token::TagArg(a) if a == r#"say "hi" now"#));
+        assert_eq!(&src[arg.span.start..arg.span.end], r#"say \"hi\" now"#);
+        let text = &spanned[2];
+        assert!(matches!(&text.kind, Token::Text(t) if t == " rest"));
+        assert_eq!(&src[text.span.start..text.span.end], " rest");
+    }
+
+    #[test]
+    fn test_shape_quoted_fallback_to_greedy() {
+        let table = shape_table("task", ArgShape::Quoted);
+        // No opening quote: the greedy rule captures, plus a fallback marker.
+        let tokens = shaped_tokens("#task no quotes here", &table);
+        assert!(matches!(&tokens[0], Token::UnknownTag { name } if name == "task"));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "no quotes here"));
+        assert!(matches!(&tokens[2], Token::ShapeFallback));
+
+        // Unclosed quote: same fallback (the quote is part of the argument).
+        let tokens = shaped_tokens("#task \"unclosed", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "\"unclosed"));
+        assert!(matches!(&tokens[2], Token::ShapeFallback));
+    }
+
+    #[test]
+    fn test_shape_quoted_bare_and_empty_are_not_fallbacks() {
+        let table = shape_table("task", ArgShape::Quoted);
+        // Bare tag: no argument at all is not a shape mismatch.
+        let tokens = shaped_tokens("#task", &table);
+        assert_eq!(tokens.len(), 1);
+        // Empty quotes: the shape matches, there is just no argument text.
+        let tokens = shaped_tokens("#task \"\" rest", &table);
+        assert!(matches!(&tokens[0], Token::UnknownTag { .. }));
+        assert!(matches!(&tokens[1], Token::Text(t) if t == " rest"));
+        assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn test_shape_quoted_multibyte_spans() {
+        let table = shape_table("задача", ArgShape::Quoted);
+        let src = "αβ #задача \"naïve – fix\" остаток";
+        let spanned = shaped_spanned(src, &table);
+        let tag = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::UnknownTag { .. }))
+            .unwrap();
+        assert_eq!(&src[tag.span.start..tag.span.end], "#задача");
+        let arg = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::TagArg(_)))
+            .unwrap();
+        assert_eq!(&src[arg.span.start..arg.span.end], "naïve – fix");
+        let tail = spanned.last().unwrap();
+        assert!(matches!(&tail.kind, Token::Text(t) if t == " остаток"));
+        assert_eq!(&src[tail.span.start..tail.span.end], " остаток");
+    }
+
+    #[test]
+    fn test_shape_word() {
+        let table = shape_table("ver", ArgShape::Word);
+        let tokens = shaped_tokens("#ver 1.2.3 is out", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "1.2.3"));
+        assert!(matches!(&tokens[2], Token::Text(t) if t == " is out"));
+
+        // Spans slice the source exactly.
+        let src = "#ver 1.2.3 is out";
+        let spanned = shaped_spanned(src, &table);
+        assert_eq!(&src[spanned[1].span.start..spanned[1].span.end], "1.2.3");
+    }
+
+    #[test]
+    fn test_shape_word_stops_at_tag_boundary() {
+        let table = shape_table("ver", ArgShape::Word);
+        // Like the greedy rule, a `#` that starts a tag ends the word; a
+        // missing word is a bare tag, not a fallback.
+        let tokens = shaped_tokens("#ver #todo x", &table);
+        assert!(matches!(&tokens[0], Token::UnknownTag { name } if name == "ver"));
+        assert!(matches!(&tokens[1], Token::Tag(Keyword::Todo)));
+        assert!(matches!(&tokens[2], Token::TagArg(a) if a == "x"));
+        assert!(!tokens.iter().any(|t| matches!(t, Token::ShapeFallback)));
+    }
+
+    #[test]
+    fn test_shape_kv_run_and_termination() {
+        let table = shape_table("dep", ArgShape::Kv);
+        let tokens = shaped_tokens("#dep name=serde ver=\"1.0 beta\" opt follows", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "name=serde ver=\"1.0 beta\""));
+        assert!(matches!(&tokens[2], Token::Text(t) if t == " opt follows"));
+
+        // Terminates before a following tag even without a mismatch; the
+        // separator space returns to prose.
+        let tokens = shaped_tokens("#dep k=v #todo next", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "k=v"));
+        assert!(matches!(&tokens[2], Token::Text(t) if t == " "));
+        assert!(matches!(&tokens[3], Token::Tag(Keyword::Todo)));
+
+        // Spans slice the source exactly.
+        let src = "#dep name=serde ver=\"1.0 beta\" opt";
+        let spanned = shaped_spanned(src, &table);
+        assert_eq!(
+            &src[spanned[1].span.start..spanned[1].span.end],
+            "name=serde ver=\"1.0 beta\""
+        );
+    }
+
+    #[test]
+    fn test_shape_kv_fallback() {
+        let table = shape_table("dep", ArgShape::Kv);
+        let tokens = shaped_tokens("#dep just words", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "just words"));
+        assert!(matches!(&tokens[2], Token::ShapeFallback));
+    }
+
+    #[test]
+    fn test_shape_until_punct() {
+        let table = shape_table("note", ArgShape::UntilPunct);
+        let tokens = shaped_tokens("#note call mom today. Then rest", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "call mom today"));
+        assert!(matches!(&tokens[2], Token::Text(t) if t == ". Then rest"));
+
+        let src = "#note call mom today. Then rest";
+        let spanned = shaped_spanned(src, &table);
+        assert_eq!(
+            &src[spanned[1].span.start..spanned[1].span.end],
+            "call mom today"
+        );
+    }
+
+    #[test]
+    fn test_shape_until_punct_fallback() {
+        let table = shape_table("note", ArgShape::UntilPunct);
+        // Punctuation immediately: nothing to capture, greedy takes over.
+        let tokens = shaped_tokens("#note , immediate", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == ", immediate"));
+        assert!(matches!(&tokens[2], Token::ShapeFallback));
+    }
+
+    #[test]
+    fn test_shapes_do_not_affect_undeclared_or_builtin_tags() {
+        let table = shape_table("task", ArgShape::Quoted);
+        // Built-in and undeclared tags keep the greedy rule, table or not.
+        let tokens = shaped_tokens("#todo \"not shaped\" rest", &table);
+        assert!(matches!(&tokens[0], Token::Tag(Keyword::Todo)));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "\"not shaped\" rest"));
+        let tokens = shaped_tokens("#other \"not shaped\" rest", &table);
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "\"not shaped\" rest"));
+        assert!(!tokens.iter().any(|t| matches!(t, Token::ShapeFallback)));
     }
 }

@@ -214,6 +214,40 @@ fn test_invalid_tags_config_warns_and_degrades() {
 }
 
 #[test]
+fn test_lint_warns_on_shape_fallback() {
+    // An extent shape (plan §10.4 T2) that fails at the lexer falls back to
+    // the greedy rule and surfaces through the same shape_mismatch warning.
+    let fixture = Fixture::new(
+        "[tags.task]\nshape = \"quoted\"\n",
+        "intro #task \"well shaped\" prose\n\nintro #task not quoted at all\n",
+    );
+    let out = fixture.run(&["lint", &vault_arg(&fixture)]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("argument does not match the declared pattern for #task"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("0 error(s), 1 warning(s)"), "{stdout}");
+}
+
+#[test]
+fn test_invalid_shape_config_warns_and_degrades() {
+    let fixture = Fixture::new("[tags.task]\nshape = \"regex\"\n", "intro #task whatever\n");
+    let out = fixture.run(&["lint", &vault_arg(&fixture)]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown shape") && stderr.contains("until-punct"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn test_builtin_collision_config_warns() {
     let fixture = Fixture::new(
         "[tags.deadline]\nkind = \"date\"\n",
@@ -226,4 +260,132 @@ fn test_builtin_collision_config_warns() {
         stderr.contains("invalid [tags] config") && stderr.contains("built-in"),
         "{stderr}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `morg emit-grammar`
+// ---------------------------------------------------------------------------
+
+/// A stand-in tree-sitter-morg grammar.js: only the marked region matters.
+const GRAMMAR_STUB: &str = "// header kept verbatim\n\
+// BEGIN GENERATED (morg emit-grammar)\n\
+stale contents to be replaced\n\
+// END GENERATED\n\
+\n// trailer kept verbatim\n";
+
+const SHAPES_CONFIG: &str = r#"
+[tags.ztitle]
+shape = "quoted"
+
+[tags.zver]
+shape = "word"
+
+[tags.zdep]
+shape = "kv"
+
+[tags.znote]
+shape = "until-punct"
+
+[tags.zfree]
+shape = "greedy"
+
+[tags.book]
+pattern = '"(?<title>[^"]+)"\s+by\s+(?<author>.+)'
+"#;
+
+#[test]
+fn test_emit_grammar_renders_shaped_rules_idempotently() {
+    let fixture = Fixture::new(SHAPES_CONFIG, "unused\n");
+    let dir = fixture.root.join("ts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let grammar = dir.join("grammar.js");
+    std::fs::write(&grammar, GRAMMAR_STUB).unwrap();
+    let dir_arg = dir.display().to_string();
+
+    let out = fixture.run(&["emit-grammar", "--grammar-dir", &dir_arg]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("4 shaped tags"), "{stdout}");
+    assert!(stdout.contains("tree-sitter generate"), "{stdout}");
+
+    let once = std::fs::read_to_string(&grammar).unwrap();
+    // Text outside the markers survives verbatim.
+    assert!(once.starts_with("// header kept verbatim\n"), "{once}");
+    assert!(once.ends_with("\n// trailer kept verbatim\n"), "{once}");
+    // One rule per non-greedy shaped tag; greedy and pattern-only tags stay
+    // on the default rule, built-ins come from the canonical keyword list.
+    for rule in [
+        "inline_tag_ztitle",
+        "inline_tag_zver",
+        "inline_tag_zdep",
+        "inline_tag_znote",
+    ] {
+        assert!(once.contains(rule), "{rule} missing:\n{once}");
+    }
+    assert!(!once.contains("inline_tag_zfree"), "{once}");
+    assert!(!once.contains("inline_tag_book"), "{once}");
+    assert!(once.contains("\"clock-in\","), "{once}");
+    assert!(!once.contains("stale contents"), "{once}");
+
+    // Re-running is byte-identical and says so.
+    let out = fixture.run(&["emit-grammar", "--grammar-dir", &dir_arg]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("up to date"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let twice = std::fs::read_to_string(&grammar).unwrap();
+    assert_eq!(once, twice, "emit-grammar must be idempotent");
+}
+
+#[test]
+fn test_emit_grammar_empty_tags_renders_default_region() {
+    let fixture = Fixture::new("", "unused\n");
+    let dir = fixture.root.join("ts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let grammar = dir.join("grammar.js");
+    std::fs::write(&grammar, GRAMMAR_STUB).unwrap();
+    let dir_arg = dir.display().to_string();
+
+    let out = fixture.run(&["emit-grammar", "--grammar-dir", &dir_arg]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let content = std::fs::read_to_string(&grammar).unwrap();
+    assert!(
+        content.contains("const SHAPED_TAG_RULES = {};"),
+        "{content}"
+    );
+    assert!(content.contains("const KEYWORDS = ["), "{content}");
+}
+
+#[test]
+fn test_emit_grammar_requires_a_grammar_dir() {
+    let fixture = Fixture::new("", "unused\n");
+    let out = fixture.run(&["emit-grammar"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--grammar-dir"), "{stderr}");
+}
+
+#[test]
+fn test_emit_grammar_rejects_rule_key_collision() {
+    let fixture = Fixture::new(
+        "[tags.my-tag]\nshape = \"word\"\n\n[tags.my_tag]\nshape = \"quoted\"\n",
+        "unused\n",
+    );
+    let dir = fixture.root.join("ts");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("grammar.js"), GRAMMAR_STUB).unwrap();
+    let out = fixture.run(&["emit-grammar", "--grammar-dir", &dir.display().to_string()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("same grammar rule key"), "{stderr}");
 }

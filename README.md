@@ -9,6 +9,7 @@ morg-mode extends standard markdown with a `#tag` system for metadata, time trac
 ## Features
 
 - **Tag system** -- `#todo`, `#deadline`, `#scheduled`, `#clock`, `#priority`, `#effort`, `#archive`, `#media`, `#anchor`, and more. Tags are inline (`text #todo fix this`) or block-level (`#deadline 2026-04-10`). Tag names are Unicode-aware.
+- **User-defined tags** -- declare custom tags under `[tags]` in the config: a regex `pattern` or `kind` shorthand interprets the argument, and an optional argument extent `shape` (`greedy` | `quoted` | `word` | `kv` | `until-punct`, a closed vocabulary) declares where an *inline* argument ends — `#task "fix this" and more` ends at the closing quote, the rest is prose. Shapes fall back to the greedy rule (flagged by `morg lint`) when they fail to match. **Caveat:** shapes make the config part of the file format — a vault using them must travel with its `[tags]` config to parse identically elsewhere.
 - **Citations** -- Pandoc-style `[@key]` and `[@key, p. 4]` inline citations, parsed into typed segments and preserved in HTML export.
 - **Anchors** -- `#anchor name` gives blocks stable addresses (`id#name`), trailing on headings, paragraphs, and list items or standalone.
 - **Code tangling** -- Extract tagged code blocks into standalone files with `#tangle file=path`. Supports noweb references (`<<block-name>>`), indent preservation, and recursive expansion.
@@ -101,6 +102,7 @@ Tags are prefixed with `#` (no space -- a space after `#` makes it a heading). E
 | `morg time` | Time tracking report |
 | `morg search` | Full-text and tag search |
 | `morg tags` | Tabulate a custom tag declared in `[tags]` config |
+| `morg emit-grammar` | Render tree-sitter-morg's generated region from `[tags]` |
 | `morg lint` | Validate documents |
 | `morg export` | Markdown to HTML |
 | `morg ical` | Export to iCalendar |
@@ -133,6 +135,11 @@ carry_todos = true
 
 [capture]
 templates_file = "~/.config/morg/capture.yaml"
+
+# Where `morg emit-grammar` finds tree-sitter-morg's grammar.js
+# (overridden by --grammar-dir)
+[grammar]
+dir = "~/Code/Software/Morog/tree-sitter-morg"
 ```
 
 ## Neovim Plugin

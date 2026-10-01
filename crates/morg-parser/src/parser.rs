@@ -1070,13 +1070,56 @@ fn parse_block_tag(lex: &mut Lexer<'_>, table: &TagTable) -> Block {
         Some((raw, Span::new(start, end, span.line, col)))
     });
 
-    Block::BlockTag(tags::parse_tag_with(
+    // Block-level extent is always the whole line; a declared shape only
+    // structures/validates the argument here. When the shape matches the
+    // entire argument, its capture (e.g. the text inside the quotes) becomes
+    // what the interpretation rule sees; otherwise the argument stays as-is
+    // and the tag is flagged via shape_mismatch.
+    let shape = match morg_keyword(&name) {
+        Some(_) => crate::tag_table::ArgShape::Greedy,
+        None => table.shape(&name),
+    };
+    let mut shape_fallback = false;
+    let shaped = if shape != crate::tag_table::ArgShape::Greedy
+        && let Some((raw, raw_span)) = raw_arg
+    {
+        match lexer::match_shape_exact(shape, raw) {
+            Some((value, rel_start, rel_end)) => {
+                let sub = Span::new(
+                    raw_span.start + rel_start,
+                    raw_span.start + rel_end,
+                    raw_span.line,
+                    raw_span.col + rel_start as u32,
+                );
+                Some((value, (&raw[rel_start..rel_end], sub)))
+            }
+            None => {
+                shape_fallback = true;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (effective_arg, effective_raw) = match &shaped {
+        Some((value, raw)) => (Some(value.as_str()), Some(*raw)),
+        None => (arg_string.as_deref(), raw_arg),
+    };
+
+    Block::BlockTag(tags::parse_tag_full(
         &name,
-        arg_string.as_deref(),
-        raw_arg,
+        effective_arg,
+        effective_raw,
+        shape_fallback,
         span,
         table,
     ))
+}
+
+/// Keyword lookup shared by the block-tag shape gate.
+fn morg_keyword(name: &str) -> Option<crate::tokens::Keyword> {
+    crate::tokens::Keyword::from_str(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,7 +1180,7 @@ fn sub_span(outer: Span, raw: &str, sub: &str) -> Span {
 }
 
 fn build_inline_content(text: &str, span: Span, source: &str, table: &TagTable) -> InlineContent {
-    let tokens = lexer::tokenize_inline(text, span);
+    let tokens = lexer::tokenize_inline_with(text, span, table);
     tokens_to_inline_content(&tokens, source, table)
 }
 
@@ -1251,17 +1294,30 @@ fn tokens_to_inline_content(
                 i += 1;
             }
             Token::Tag(kw) => {
-                let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
+                let (arg, span, shape_fallback) = take_tag_arg(tokens, &mut i, tok_span);
                 let raw_arg = raw_tag_arg(&arg, source);
-                let tag =
-                    tags::parse_tag_with(kw.as_str(), arg.map(|(a, _)| a), raw_arg, span, table);
+                let tag = tags::parse_tag_full(
+                    kw.as_str(),
+                    arg.map(|(a, _)| a),
+                    raw_arg,
+                    shape_fallback,
+                    span,
+                    table,
+                );
                 push(InlineKind::Tag(tag), span);
                 i += 1;
             }
             Token::UnknownTag { name } => {
-                let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
+                let (arg, span, shape_fallback) = take_tag_arg(tokens, &mut i, tok_span);
                 let raw_arg = raw_tag_arg(&arg, source);
-                let tag = tags::parse_tag_with(name, arg.map(|(a, _)| a), raw_arg, span, table);
+                let tag = tags::parse_tag_full(
+                    name,
+                    arg.map(|(a, _)| a),
+                    raw_arg,
+                    shape_fallback,
+                    span,
+                    table,
+                );
                 push(InlineKind::Tag(tag), span);
                 i += 1;
             }
@@ -1280,19 +1336,32 @@ fn tokens_to_inline_content(
 }
 
 /// If the token after `*i` is a `TagArg`, consume it and return the argument
-/// text with its own span, plus the tag span extended to cover the argument.
+/// text with its own span, plus the tag span extended to cover the argument,
+/// plus whether a `ShapeFallback` marker followed (the lexer's signal that a
+/// declared extent shape failed and the greedy rule was used).
 fn take_tag_arg<'a>(
     tokens: &'a [crate::tokens::Spanned],
     i: &mut usize,
     tag_span: Span,
-) -> (Option<(&'a str, Span)>, Span) {
+) -> (Option<(&'a str, Span)>, Span, bool) {
     if let Some(next) = tokens.get(*i + 1)
         && let Token::TagArg(a) = &next.kind
     {
         *i += 1;
-        (Some((a.as_str(), next.span)), tag_span.merge(next.span))
+        let shape_fallback = matches!(
+            tokens.get(*i + 1).map(|t| &t.kind),
+            Some(Token::ShapeFallback)
+        );
+        if shape_fallback {
+            *i += 1;
+        }
+        (
+            Some((a.as_str(), next.span)),
+            tag_span.merge(next.span),
+            shape_fallback,
+        )
     } else {
-        (None, tag_span)
+        (None, tag_span, false)
     }
 }
 
@@ -2314,7 +2383,7 @@ mod tests {
         TagTable::build([TagDeclaration {
             name: "book".to_string(),
             pattern: Some(r#""(?<title>[^"]+)"\s+by\s+(?<author>.+)"#.to_string()),
-            kind: None,
+            ..Default::default()
         }])
         .unwrap()
     }
@@ -2322,8 +2391,8 @@ mod tests {
     fn kind_table(name: &str, kind: CustomArgKind) -> TagTable {
         TagTable::build([TagDeclaration {
             name: name.to_string(),
-            pattern: None,
             kind: Some(kind),
+            ..Default::default()
         }])
         .unwrap()
     }
@@ -2571,7 +2640,7 @@ mod tests {
         let optional = TagTable::build([TagDeclaration {
             name: "flagged".to_string(),
             pattern: Some("(?<why>.*)".to_string()),
-            kind: None,
+            ..Default::default()
         }])
         .unwrap();
         let result = parse_document_with("#flagged\n", &optional);
@@ -2617,5 +2686,130 @@ mod tests {
         let plain = parse_document(src);
         let with_table = parse_document_with(src, &book_table());
         assert_eq!(plain.document, with_table.document);
+    }
+
+    // Argument extent shapes (plan §10.4 T2)
+
+    use crate::tag_table::ArgShape;
+
+    fn shaped_table(decls: &[(&str, ArgShape, Option<&str>)]) -> TagTable {
+        TagTable::build(decls.iter().map(|(name, shape, pattern)| TagDeclaration {
+            name: name.to_string(),
+            pattern: pattern.map(str::to_string),
+            shape: Some(*shape),
+            ..Default::default()
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_shape_inline_extent_vs_block_whole_line() {
+        let table = shaped_table(&[("task", ArgShape::Quoted, None)]);
+
+        // Inline: the tag ends at the closing quote; the rest is prose.
+        let result = parse_document_with("intro #task \"fix this\" and more\n", &table);
+        let para = match &result.document.children[0] {
+            Block::Paragraph(p) => p,
+            other => panic!("expected paragraph, got {other:?}"),
+        };
+        let (fields, mismatch) = expect_custom(para.content.tags()[0], "task");
+        assert!(!mismatch);
+        assert!(fields.is_empty());
+        assert!(matches!(
+            &para.content.tags()[0].kind,
+            TagKind::Custom { raw: Some(r), .. } if r == "fix this"
+        ));
+        // The trailing prose survives as a text segment.
+        assert!(
+            para.content
+                .segments
+                .iter()
+                .any(|s| matches!(&s.kind, InlineKind::Text(t) if t.contains("and more")))
+        );
+
+        // Block level: the whole line stays the argument regardless of shape.
+        // A fully-shaped argument is structured (quotes stripped)...
+        let result = parse_document_with("#task \"fix this\"\n", &table);
+        let tag = all_tags(&result.document)[0];
+        let (_, mismatch) = expect_custom(tag, "task");
+        assert!(!mismatch);
+        assert!(
+            matches!(&tag.kind, TagKind::Custom { raw: Some(r), .. } if r == "fix this"),
+            "{:?}",
+            tag.kind
+        );
+
+        // ...while trailing content after the shape is a mismatch, never a
+        // repartition into tag + prose.
+        let result = parse_document_with("#task \"fix this\" and more\n", &table);
+        assert!(
+            matches!(&result.document.children[0], Block::BlockTag(_)),
+            "the line stays one block tag, never tag + trailing prose"
+        );
+        let tag = all_tags(&result.document)[0];
+        let (_, mismatch) = expect_custom(tag, "task");
+        assert!(mismatch);
+        assert!(
+            matches!(&tag.kind, TagKind::Custom { raw: Some(r), .. } if r == "\"fix this\" and more")
+        );
+    }
+
+    #[test]
+    fn test_shape_fallback_sets_mismatch_inline() {
+        let table = shaped_table(&[("task", ArgShape::Quoted, None)]);
+        let result = parse_document_with("intro #task no quotes here\n", &table);
+        let tag = all_tags(&result.document)[0];
+        let (fields, mismatch) = expect_custom(tag, "task");
+        assert!(mismatch, "greedy fallback must flag shape_mismatch");
+        assert!(fields.is_empty());
+        assert!(matches!(&tag.kind, TagKind::Custom { raw: Some(r), .. } if r == "no quotes here"));
+    }
+
+    #[test]
+    fn test_shape_composes_with_pattern() {
+        // The shape bounds the extent; the pattern interprets the capture.
+        let table = shaped_table(&[("book", ArgShape::Quoted, Some(r"^(?<first>\S+)"))]);
+        let src = "x #book \"Dune Messiah\" y\n";
+        let result = parse_document_with(src, &table);
+        let (fields, mismatch) = expect_custom(all_tags(&result.document)[0], "book");
+        assert!(!mismatch);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "Dune");
+        // Field spans still slice the source exactly (inside the quotes).
+        assert_eq!(&src[fields[0].span.start..fields[0].span.end], "Dune");
+    }
+
+    #[test]
+    fn test_shape_word_and_until_punct_in_paragraphs() {
+        let table = shaped_table(&[
+            ("ver", ArgShape::Word, None),
+            ("note", ArgShape::UntilPunct, None),
+        ]);
+        let src = "release #ver 1.2.3 shipped, see #note the changelog entry. Done.\n";
+        let result = parse_document_with(src, &table);
+        let tags = all_tags(&result.document);
+        assert!(matches!(&tags[0].kind, TagKind::Custom { raw: Some(r), .. } if r == "1.2.3"));
+        assert!(matches!(
+            &tags[1].kind,
+            TagKind::Custom { raw: Some(r), shape_mismatch: false, .. }
+                if r == "the changelog entry"
+        ));
+    }
+
+    #[test]
+    fn test_shape_kv_block_validation() {
+        let table = shaped_table(&[("dep", ArgShape::Kv, None)]);
+        // Block argument that is all pairs: valid.
+        let result = parse_document_with("#dep name=serde ver=\"1.0\"\n", &table);
+        let (_, mismatch) = expect_custom(all_tags(&result.document)[0], "dep");
+        assert!(!mismatch);
+        // Trailing non-pair content: whole line kept, flagged.
+        let result = parse_document_with("#dep name=serde oops\n", &table);
+        let tag = all_tags(&result.document)[0];
+        let (_, mismatch) = expect_custom(tag, "dep");
+        assert!(mismatch);
+        assert!(
+            matches!(&tag.kind, TagKind::Custom { raw: Some(r), .. } if r == "name=serde oops")
+        );
     }
 }
