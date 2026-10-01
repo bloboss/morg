@@ -130,6 +130,13 @@ pub enum Command {
         /// Markdown files or directories to lint
         files: Vec<PathBuf>,
     },
+    /// Render tree-sitter-morg's generated region from the [tags] config
+    EmitGrammar {
+        /// Directory containing tree-sitter-morg's grammar.js
+        /// (default: the `[grammar] dir` config key)
+        #[arg(long)]
+        grammar_dir: Option<PathBuf>,
+    },
     /// Tabulate occurrences of a custom tag declared in the [tags] config
     Tags {
         /// Custom tag name (without the leading #), as declared under [tags]

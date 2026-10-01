@@ -3,6 +3,7 @@ pub mod archive;
 pub mod capture;
 pub mod columns;
 pub mod diary;
+pub mod emit_grammar;
 pub mod export;
 pub mod frontmatter;
 pub mod ical;

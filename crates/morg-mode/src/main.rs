@@ -70,6 +70,9 @@ fn main() {
         }
         Command::Capture { template, input } => commands::capture::run(&template, &input),
         Command::Lint { files } => commands::lint::run(&default_files(files), json, &tag_table),
+        Command::EmitGrammar { grammar_dir } => {
+            commands::emit_grammar::run(&cfg, grammar_dir.as_deref())
+        }
         Command::Tags { name, files } => {
             commands::tags::run(&name, &default_files(files), json, &tag_table)
         }
