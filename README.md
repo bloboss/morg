@@ -9,6 +9,7 @@ morg-mode extends standard markdown with a `#tag` system for metadata, time trac
 ## Features
 
 - **Tag system** -- `#todo`, `#deadline`, `#scheduled`, `#clock`, `#priority`, `#effort`, `#archive`, `#media`, `#anchor`, and more. Tags are inline (`text #todo fix this`) or block-level (`#deadline 2026-04-10`). Tag names are Unicode-aware.
+- **User-defined tags** -- declare custom tags under `[tags]` in the config: a regex `pattern` or `kind` shorthand interprets the argument, and an optional argument extent `shape` (`greedy` | `quoted` | `word` | `kv` | `until-punct`, a closed vocabulary) declares where an *inline* argument ends — `#task "fix this" and more` ends at the closing quote, the rest is prose. Shapes fall back to the greedy rule (flagged by `morg lint`) when they fail to match. **Caveat:** shapes make the config part of the file format — a vault using them must travel with its `[tags]` config to parse identically elsewhere.
 - **Citations** -- Pandoc-style `[@key]` and `[@key, p. 4]` inline citations, parsed into typed segments and preserved in HTML export.
 - **Anchors** -- `#anchor name` gives blocks stable addresses (`id#name`), trailing on headings, paragraphs, and list items or standalone.
 - **Code tangling** -- Extract tagged code blocks into standalone files with `#tangle file=path`. Supports noweb references (`<<block-name>>`), indent preservation, and recursive expansion.

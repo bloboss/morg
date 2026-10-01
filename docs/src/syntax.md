@@ -19,7 +19,7 @@ A tag on its own line is block-level. The argument extends to end of line.
 
 ### Inline tags
 
-Tags can appear within text. The argument extends to the next `#` or end of line.
+Tags can appear within text. The argument extends to the next `#` or end of line (the greedy default — a custom tag may declare a different [extent shape](#argument-extent-shapes)).
 
 ```
 Some text #todo fix this before #deadline 2026-04-15
@@ -43,10 +43,10 @@ pattern = '"(?<title>[^"]+)"\s+by\s+(?<author>.+)'   # named capture groups
 kind = "duration"      # duration | date | timestamp | slug
 ```
 
-Each declaration carries exactly one rule. A `pattern` is a regex (the
-`regex` crate: no lookaround, no catastrophic backtracking) whose named
-capture groups become the tag's fields. A `kind` reuses a built-in argument
-parser — `duration` (`#effort`-style `1h30m`), `date` / `timestamp`
+Each declaration carries at most one interpretation rule. A `pattern` is a
+regex (the `regex` crate: no lookaround, no catastrophic backtracking) whose
+named capture groups become the tag's fields. A `kind` reuses a built-in
+argument parser — `duration` (`#effort`-style `1h30m`), `date` / `timestamp`
 (`#deadline`-style), or `slug` (`#anchor`-style) — and yields one field named
 after the kind holding the value's canonical rendering. Built-in tag names
 cannot be redefined.
@@ -55,6 +55,53 @@ Interpretation is lenient: an argument that does not match the declared
 shape leaves the document untouched and only flags the tag, which `morg
 lint` reports as a warning. `morg tags <name>` tabulates every occurrence
 of a declared tag with one column per field.
+
+### Argument extent shapes
+
+A declaration may also carry a `shape`, which changes where a custom tag's
+**inline** argument *ends*. The vocabulary is closed — one of five shapes,
+never a regex at the lexer:
+
+```toml
+[tags.task]
+shape = "quoted"       # greedy | quoted | word | kv | until-punct
+
+[tags.dep]
+shape = "kv"
+pattern = 'name=(?<name>\S+)'   # shape bounds the extent, pattern interprets
+```
+
+- `greedy` — the universal default: to the next `#` that starts a tag, or
+  end of line.
+- `quoted` — a `"..."` string right after the name (`\"` escapes a quote).
+  The tag ends at the closing quote and the rest of the line returns to
+  normal prose: in `#task "fix this" and more`, only `fix this` is the
+  argument.
+- `word` — one whitespace-delimited word.
+- `kv` — a run of `key=value` pairs (values optionally quoted), ending
+  before the first token that is not one.
+- `until-punct` — up to (excluding) the first of `.,;:!?` or end of line.
+
+A shape may stand alone (a plain declaration) or compose with
+`pattern`/`kind`: the shape bounds the extent, then the rule interprets the
+captured text. If a shape fails to match where the tag is lexed (say,
+`quoted` with no opening quote), the argument falls back to the greedy rule
+and the tag is flagged `shape_mismatch` — a `morg lint` warning, never an
+error and never a differently-shaped document.
+
+**Block-level tags keep their whole-line argument extent regardless of
+shape.** On a line of its own, `#task "fix this" and more` is still one
+block tag whose argument is the full `"fix this" and more` — the shape only
+validates/structures the argument there (and flags a mismatch when trailing
+content follows it); a block line is never repartitioned into a tag plus
+trailing prose.
+
+**Interchange caveat:** unlike interpretation, shapes make the config part
+of the file format. A vault that uses extent shapes must travel with its
+`[tags]` config (e.g. a vault-local `.morog.toml`) — without it, another
+tool (or the same tool on another machine) parses shaped inline tags with
+the greedy extent and sees a *different document*. Keep shapes out of vaults
+you share without their config.
 
 ## Media
 
