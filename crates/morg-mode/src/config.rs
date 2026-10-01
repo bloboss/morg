@@ -3,8 +3,10 @@
 //! Config file location: `$XDG_CONFIG_HOME/morg/config.toml`
 //! (typically `~/.config/morg/config.toml`)
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use morg_parser::tag_table::{CustomArgKind, TagDeclaration, TagTable};
 use serde::Deserialize;
 
 /// Top-level configuration.
@@ -20,6 +22,22 @@ pub struct Config {
 
     /// Capture template configuration (legacy — still read from capture.yaml too).
     pub capture: CaptureConfig,
+
+    /// User-defined tag declarations: `[tags.<name>]` with `pattern` (regex
+    /// with named capture groups) or `kind` (duration | date | timestamp |
+    /// slug). BTreeMap keeps build errors deterministic.
+    pub tags: BTreeMap<String, TagConfig>,
+}
+
+/// One `[tags.<name>]` entry. Exactly one of `pattern`/`kind` must be set;
+/// [`Config::build_tag_table`] enforces that.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct TagConfig {
+    /// Regex with named capture groups, matched against the raw argument.
+    pub pattern: Option<String>,
+    /// Built-in argument parser shorthand.
+    pub kind: Option<String>,
 }
 
 /// Diary configuration.
@@ -70,6 +88,7 @@ impl Default for Config {
             root: default_root(),
             diary: DiaryConfig::default(),
             capture: CaptureConfig::default(),
+            tags: BTreeMap::new(),
         }
     }
 }
@@ -107,6 +126,32 @@ impl Config {
     /// Resolved today file path.
     pub fn diary_today(&self) -> PathBuf {
         self.diary_dir().join(&self.diary.today_file)
+    }
+
+    /// Compile the `[tags]` section into a [`TagTable`]. Built once at
+    /// startup and passed to the commands that parse documents.
+    pub fn build_tag_table(&self) -> Result<TagTable, Box<dyn std::error::Error>> {
+        let declarations = self
+            .tags
+            .iter()
+            .map(|(name, tc)| {
+                let kind = match tc.kind.as_deref() {
+                    Some(k) => Some(CustomArgKind::from_str(k).ok_or_else(|| {
+                        format!(
+                            "tag '{name}': unknown kind '{k}' \
+                             (expected duration, date, timestamp, or slug)"
+                        )
+                    })?),
+                    None => None,
+                };
+                Ok(TagDeclaration {
+                    name: name.clone(),
+                    pattern: tc.pattern.clone(),
+                    kind,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(TagTable::build(declarations)?)
     }
 
     /// Expand `~/` in all path fields.
@@ -198,6 +243,14 @@ pub fn init_config() -> Result<(), Box<dyn std::error::Error>> {
 
 [capture]
 # templates_file = "~/.config/morg/capture.yaml"
+
+# User-defined tags: declare how a custom tag's argument is interpreted.
+# Either a regex `pattern` with named capture groups, or a `kind` shorthand
+# (duration | date | timestamp | slug). Built-in tag names cannot be redefined.
+# [tags.book]
+# pattern = '"(?<title>[^"]+)"\s+by\s+(?<author>.+)'
+# [tags.reading-time]
+# kind = "duration"
 "#;
 
     std::fs::write(&path, default_toml)?;
@@ -289,6 +342,55 @@ templates_file = "/home/user/.config/morg/capture.yaml"
         // All defaults should apply
         assert!(cfg.root.to_string_lossy().ends_with(".morg"));
         assert!(cfg.diary.carry_todos);
+    }
+
+    #[test]
+    fn test_parse_toml_tags_section() {
+        let toml_str = r#"
+[tags.book]
+pattern = '"(?<title>[^"]+)"\s+by\s+(?<author>.+)'
+
+[tags.reading-time]
+kind = "duration"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.tags.len(), 2);
+        let table = cfg.build_tag_table().unwrap();
+        assert!(table.contains("book"));
+        assert_eq!(
+            table.group_names("reading-time").unwrap(),
+            vec!["duration".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_build_tag_table_errors() {
+        // Unknown kind word.
+        let cfg: Config = toml::from_str("[tags.x]\nkind = \"frobnicate\"\n").unwrap();
+        let err = cfg.build_tag_table().unwrap_err().to_string();
+        assert!(err.contains("x") && err.contains("frobnicate"), "{err}");
+
+        // Table-build errors (bad regex, builtin collision, conflict)
+        // propagate with the tag name.
+        let cfg: Config = toml::from_str("[tags.y]\npattern = \"(\"\n").unwrap();
+        assert!(cfg.build_tag_table().unwrap_err().to_string().contains("y"));
+
+        let cfg: Config = toml::from_str("[tags.deadline]\nkind = \"date\"\n").unwrap();
+        let err = cfg.build_tag_table().unwrap_err().to_string();
+        assert!(
+            err.contains("deadline") && err.contains("built-in"),
+            "{err}"
+        );
+
+        let cfg: Config = toml::from_str("[tags.z]\npattern = \".*\"\nkind = \"slug\"\n").unwrap();
+        let err = cfg.build_tag_table().unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn test_default_config_empty_tag_table() {
+        let table = Config::default().build_tag_table().unwrap();
+        assert!(table.is_empty());
     }
 
     #[test]

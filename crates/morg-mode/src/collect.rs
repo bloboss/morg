@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use morg_parser::ast::*;
 use morg_parser::error::ParseError;
-use morg_parser::parser::{ParseResult, parse_document};
+use morg_parser::parser::{ParseResult, parse_document_with};
+use morg_parser::tag_table::TagTable;
 use morg_parser::tags::{Tag, TagKind};
 
 pub struct ParsedFile {
@@ -53,6 +54,13 @@ fn is_markdown(path: &Path) -> bool {
 }
 
 pub fn parse_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
+    parse_files_with(paths, &TagTable::empty())
+}
+
+/// Like [`parse_files`], but with user tag declarations from the `[tags]`
+/// config. Commands that care about custom tags use this; the rest stay on
+/// [`parse_files`].
+pub fn parse_files_with(paths: &[PathBuf], table: &TagTable) -> Vec<ParsedFile> {
     let files = resolve_paths(paths);
     files
         .into_iter()
@@ -64,7 +72,7 @@ pub fn parse_files(paths: &[PathBuf]) -> Vec<ParsedFile> {
                     return None;
                 }
             };
-            let ParseResult { document, errors } = parse_document(&source);
+            let ParseResult { document, errors } = parse_document_with(&source, table);
             for err in &errors {
                 eprintln!("{}:{}", path.display(), err);
             }
@@ -208,7 +216,9 @@ fn walk_block_with_inheritance<'a>(
                 .tags()
                 .iter()
                 .filter_map(|t| match &t.kind {
-                    TagKind::Unknown { name, .. } => Some(name.clone()),
+                    TagKind::Unknown { name, .. } | TagKind::Custom { name, .. } => {
+                        Some(name.clone())
+                    }
                     _ => None,
                 })
                 .collect();

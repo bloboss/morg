@@ -15,6 +15,16 @@ fn main() {
     let json = cli.format == "json";
     let cfg = config::load();
 
+    // Compile the [tags] declarations once; commands that interpret custom
+    // tags take a reference, the rest stay oblivious.
+    let tag_table = match cfg.build_tag_table() {
+        Ok(table) => table,
+        Err(e) => {
+            eprintln!("warning: invalid [tags] config: {e}");
+            morg_parser::tag_table::TagTable::empty()
+        }
+    };
+
     // Helper: if files list is empty, fall back to config.root
     let default_files = |files: Vec<PathBuf>| -> Vec<PathBuf> {
         if files.is_empty() {
@@ -59,7 +69,10 @@ fn main() {
             commands::columns::run(&default_files(files), &columns)
         }
         Command::Capture { template, input } => commands::capture::run(&template, &input),
-        Command::Lint { files } => commands::lint::run(&default_files(files), json),
+        Command::Lint { files } => commands::lint::run(&default_files(files), json, &tag_table),
+        Command::Tags { name, files } => {
+            commands::tags::run(&name, &default_files(files), json, &tag_table)
+        }
         Command::Refs { files } => commands::refs::run(&default_files(files)),
         Command::Refile {
             source,
