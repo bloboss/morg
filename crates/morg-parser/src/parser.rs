@@ -1637,6 +1637,91 @@ mod tests {
     }
 
     #[test]
+    fn test_anchor_trailing_on_blocks() {
+        // Trailing #anchor on a heading, a paragraph, and a list item.
+        let src = "# Methods #anchor methods\n\nA cited claim. #anchor claim-1\n\n- evidence item #anchor ev_2021-1\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let anchor_name = |content: &InlineContent| -> Option<String> {
+            content.tags().iter().find_map(|t| match &t.kind {
+                TagKind::Anchor { name } => Some(name.clone()),
+                _ => None,
+            })
+        };
+
+        let heading = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::Heading(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(anchor_name(&heading.content).as_deref(), Some("methods"));
+
+        let para = first_paragraph(&result);
+        assert_eq!(anchor_name(&para.content).as_deref(), Some("claim-1"));
+
+        let list = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::List(l) => Some(l),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            anchor_name(&list.items[0].content).as_deref(),
+            Some("ev_2021-1")
+        );
+    }
+
+    #[test]
+    fn test_anchor_span_slices_source() {
+        // Multi-byte text before the anchor; the tag segment span (name +
+        // argument) must slice the source exactly. Paragraph is on line 3.
+        let src = "# Título\n\ncafé claim #anchor sec-1\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let seg = para
+            .content
+            .segments
+            .iter()
+            .find(|s| matches!(s.kind, InlineKind::Tag(_)))
+            .expect("should have a tag segment");
+        assert_eq!(slice(src, &seg.span), "#anchor sec-1");
+        assert_eq!(seg.span.line, 3);
+        // "café claim " is 12 bytes, so the tag starts at byte column 13.
+        assert_eq!(seg.span.col, 13);
+        if let InlineKind::Tag(tag) = &seg.kind {
+            assert!(matches!(&tag.kind, TagKind::Anchor { name } if name == "sec-1"));
+            assert_eq!(slice(src, &tag.span), "#anchor sec-1");
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn test_anchor_block_tag() {
+        // An #anchor line on its own parses as a block tag.
+        let src = "#anchor standalone-1\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty());
+        assert!(result.document.children.iter().any(|b| matches!(
+            b,
+            Block::BlockTag(Tag {
+                kind: TagKind::Anchor { name },
+                ..
+            }) if name == "standalone-1"
+        )));
+    }
+
+    #[test]
     fn test_v2_nested_checkbox_list() {
         let src = "- [ ] Parent task\n  - [x] Subtask done\n  - [ ] Subtask pending\n";
         let result = parse_document(src);

@@ -1167,6 +1167,38 @@ mod tests {
     }
 
     #[test]
+    fn test_block_anchor_tag() {
+        let tokens = block_tokens("#anchor intro-claim");
+        assert!(matches!(&tokens[0], Token::Tag(Keyword::Anchor)));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "intro-claim"));
+    }
+
+    #[test]
+    fn test_inline_trailing_anchor_tag() {
+        let tokens = inline_tokens("the claim text #anchor claim-1");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "the claim text "));
+        assert!(matches!(&tokens[1], Token::Tag(Keyword::Anchor)));
+        assert!(matches!(&tokens[2], Token::TagArg(a) if a == "claim-1"));
+    }
+
+    #[test]
+    fn test_inline_anchor_span_multibyte() {
+        // Multi-byte text before the tag; spans must slice exactly.
+        let src = "résumé claim #anchor sec-1";
+        let spanned = tokenize_inline(src, Span::new(0, src.len(), 1, 1));
+        let tag = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::Tag(Keyword::Anchor)))
+            .expect("should lex an anchor tag");
+        assert_eq!(&src[tag.span.start..tag.span.end], "#anchor");
+        let arg = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::TagArg(_)))
+            .unwrap();
+        assert_eq!(&src[arg.span.start..arg.span.end], "sec-1");
+    }
+
+    #[test]
     fn test_inline_cite_simple() {
         let tokens = inline_tokens("see [@paszke_pytorch_2019] for details");
         assert!(matches!(&tokens[0], Token::Text(t) if t == "see "));

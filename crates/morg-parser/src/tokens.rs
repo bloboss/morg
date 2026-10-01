@@ -79,6 +79,9 @@ define_keywords! {
     // Media tracking
     Media       => "media",
 
+    // Addressing
+    Anchor      => "anchor",
+
     // Structure
     Properties  => "properties",
     End         => "end",

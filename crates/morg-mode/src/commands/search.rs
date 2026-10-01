@@ -229,6 +229,7 @@ fn tag_name_str(kind: &TagKind) -> String {
             None => format!("media {kind}"),
         },
         TagKind::Purchase(p) => format!("purchase {}", p.item),
+        TagKind::Anchor { name } => format!("anchor {name}"),
         TagKind::CustomState { name, .. } => name.to_lowercase(),
         TagKind::Unknown { name, .. } => name.clone(),
     }
