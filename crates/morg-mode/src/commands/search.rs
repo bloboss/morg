@@ -231,6 +231,7 @@ fn tag_name_str(kind: &TagKind) -> String {
         TagKind::Purchase(p) => format!("purchase {}", p.item),
         TagKind::Anchor { name } => format!("anchor {name}"),
         TagKind::CustomState { name, .. } => name.to_lowercase(),
+        TagKind::Custom { name, .. } => name.clone(),
         TagKind::Unknown { name, .. } => name.clone(),
     }
 }

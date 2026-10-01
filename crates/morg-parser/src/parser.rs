@@ -10,6 +10,7 @@ use crate::ast::*;
 use crate::error::{ParseError, ParseErrorKind};
 use crate::lexer::{self, Lexer};
 use crate::span::Span;
+use crate::tag_table::TagTable;
 use crate::tags::{self, Tag};
 use crate::tokens::Token;
 
@@ -18,7 +19,17 @@ pub struct ParseResult {
     pub errors: Vec<ParseError>,
 }
 
+/// Parse a document with no user tag declarations. Equivalent to
+/// [`parse_document_with`] with an empty [`TagTable`].
 pub fn parse_document(source: &str) -> ParseResult {
+    parse_document_with(source, &TagTable::empty())
+}
+
+/// Parse a document, upgrading tags declared in `table` to
+/// [`TagKind::Custom`](crate::tags::TagKind::Custom). Lexing is unaffected:
+/// custom tags still lex as unknown tags with the greedy argument rule, and
+/// a declaration can never change the document's shape.
+pub fn parse_document_with(source: &str, table: &TagTable) -> ParseResult {
     let mut lex = Lexer::new(source);
     let mut errors = Vec::new();
 
@@ -26,7 +37,7 @@ pub fn parse_document(source: &str) -> ParseResult {
     let mut children = Vec::new();
 
     while !lex.is_eof() {
-        match parse_block(&mut lex, &mut errors) {
+        match parse_block(&mut lex, &mut errors, table) {
             Some(block) => children.push(block),
             None => {
                 lex.skip_to_next_line();
@@ -273,7 +284,11 @@ fn marked_to_plain(node: saphyr::MarkedYamlOwned) -> saphyr::YamlOwned {
 // Block dispatcher
 // ---------------------------------------------------------------------------
 
-fn parse_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Option<Block> {
+fn parse_block(
+    lex: &mut Lexer<'_>,
+    errors: &mut Vec<ParseError>,
+    table: &TagTable,
+) -> Option<Block> {
     let tok = lex.peek();
 
     match &tok.kind {
@@ -284,14 +299,14 @@ fn parse_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Option<Bloc
         }
         Token::Heading { level } => {
             let level = *level;
-            parse_heading(lex, level, errors)
+            parse_heading(lex, level, errors, table)
         }
         Token::FencedCodeOpen { .. } | Token::FencedCodeClose { .. } => {
-            Some(parse_code_block(lex, errors))
+            Some(parse_code_block(lex, errors, table))
         }
-        Token::CalloutStart { .. } => Some(parse_callout(lex, errors)),
-        Token::ListMarker { .. } => Some(parse_list(lex)),
-        Token::TableRow => Some(parse_table(lex)),
+        Token::CalloutStart { .. } => Some(parse_callout(lex, errors, table)),
+        Token::ListMarker { .. } => Some(parse_list(lex, table)),
+        Token::TableRow => Some(parse_table(lex, table)),
         Token::HtmlOpen { .. } => Some(parse_html_block(lex, errors)),
         Token::HorizontalRule => {
             let span = lex.advance().span;
@@ -300,7 +315,7 @@ fn parse_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Option<Bloc
         }
         Token::LineComment => Some(parse_line_comment(lex)),
         Token::BlockCommentOpen => Some(parse_block_comment(lex)),
-        Token::FootnoteDefStart { .. } => Some(parse_footnote_def(lex)),
+        Token::FootnoteDefStart { .. } => Some(parse_footnote_def(lex, table)),
         Token::FrontmatterDelim => {
             // --- not at line 1 — treat as paragraph text
             let span = lex.advance().span;
@@ -310,15 +325,15 @@ fn parse_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Option<Bloc
                 span,
             }))
         }
-        Token::Tag(_) | Token::UnknownTag { .. } => Some(parse_block_tag(lex)),
-        Token::Text(_) | Token::RawLine(_) => parse_paragraph(lex),
+        Token::Tag(_) | Token::UnknownTag { .. } => Some(parse_block_tag(lex, table)),
+        Token::Text(_) | Token::RawLine(_) => parse_paragraph(lex, table),
         Token::PropertiesOpen
         | Token::PropertiesClose
         | Token::BlockCommentClose
         | Token::HtmlClose { .. }
         | Token::BlockquoteContinuation => {
             // Stray structural tokens — treat as text paragraph
-            parse_paragraph(lex)
+            parse_paragraph(lex, table)
         }
         _ => {
             // Skip unknown tokens
@@ -332,15 +347,26 @@ fn parse_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Option<Bloc
 // Heading + property drawer
 // ---------------------------------------------------------------------------
 
-fn parse_heading(lex: &mut Lexer<'_>, level: u8, errors: &mut Vec<ParseError>) -> Option<Block> {
+fn parse_heading(
+    lex: &mut Lexer<'_>,
+    level: u8,
+    errors: &mut Vec<ParseError>,
+    table: &TagTable,
+) -> Option<Block> {
     let head_span = lex.advance().span; // consume Heading token
+    let source = lex.source();
     let raw = consume_raw_line(lex);
     skip_newline(lex);
 
     let text = raw.trim_start();
     let content_start = text.find(' ').map(|i| i + 1).unwrap_or(text.len());
     let content_text = &text[content_start..];
-    let content = build_inline_content(content_text, sub_span(head_span, &raw, content_text));
+    let content = build_inline_content(
+        content_text,
+        sub_span(head_span, &raw, content_text),
+        source,
+        table,
+    );
 
     // Look ahead for property drawer
     let saved = lex.position();
@@ -416,7 +442,7 @@ fn parse_property_drawer(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> P
 // Code block
 // ---------------------------------------------------------------------------
 
-fn parse_code_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Block {
+fn parse_code_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>, table: &TagTable) -> Block {
     let tok = lex.advance();
     let open_span = tok.span;
 
@@ -435,7 +461,7 @@ fn parse_code_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Block 
     skip_newline(lex);
     let info_str = &info_string;
 
-    let (lang, code_tags, attributes) = parse_code_info(info_str, open_span);
+    let (lang, code_tags, attributes) = parse_code_info(info_str, open_span, table);
     let mut body_lines: Vec<String> = Vec::new();
 
     loop {
@@ -479,7 +505,11 @@ fn parse_code_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Block 
     })
 }
 
-fn parse_code_info(info: &str, span: Span) -> (Option<String>, Vec<Tag>, HashMap<String, String>) {
+fn parse_code_info(
+    info: &str,
+    span: Span,
+    table: &TagTable,
+) -> (Option<String>, Vec<Tag>, HashMap<String, String>) {
     let parts: Vec<&str> = info.split_whitespace().collect();
     if parts.is_empty() {
         return (None, Vec::new(), HashMap::new());
@@ -490,16 +520,16 @@ fn parse_code_info(info: &str, span: Span) -> (Option<String>, Vec<Tag>, HashMap
         .map(|p| p.to_string());
     let meta_start = if lang.is_some() { 1 } else { 0 };
     let meta_str = parts[meta_start..].join(" ");
-    let (tag_list, attrs) = parse_metadata(&meta_str, span);
+    let (tag_list, attrs) = parse_metadata(&meta_str, span, table);
     (lang, tag_list, attrs)
 }
 
-fn parse_metadata(info: &str, span: Span) -> (Vec<Tag>, HashMap<String, String>) {
+fn parse_metadata(info: &str, span: Span, table: &TagTable) -> (Vec<Tag>, HashMap<String, String>) {
     let mut tag_list = Vec::new();
     let mut attrs = HashMap::new();
     for part in info.split_whitespace() {
         if part.starts_with('#') && part.len() > 1 {
-            tag_list.push(tags::parse_tag(&part[1..], None, span));
+            tag_list.push(tags::parse_tag_with(&part[1..], None, None, span, table));
         } else if let Some((key, value)) = part.split_once('=') {
             attrs.insert(key.to_string(), value.to_string());
         }
@@ -511,7 +541,7 @@ fn parse_metadata(info: &str, span: Span) -> (Vec<Tag>, HashMap<String, String>)
 // Callout
 // ---------------------------------------------------------------------------
 
-fn parse_callout(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Block {
+fn parse_callout(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>, table: &TagTable) -> Block {
     let tok = lex.advance();
     let open_span = tok.span;
 
@@ -521,7 +551,7 @@ fn parse_callout(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Block {
     };
 
     let (callout_tags, attributes) = match metadata.as_deref() {
-        Some(meta) => parse_metadata(meta, open_span),
+        Some(meta) => parse_metadata(meta, open_span, table),
         None => (Vec::new(), HashMap::new()),
     };
 
@@ -566,7 +596,7 @@ fn parse_callout(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Block {
     }
 
     let inner_source = content_lines.join("\n");
-    let inner_result = parse_document(&inner_source);
+    let inner_result = parse_document_with(&inner_source, table);
     errors.extend(inner_result.errors);
 
     Block::Callout(Callout {
@@ -582,8 +612,9 @@ fn parse_callout(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Block {
 // List
 // ---------------------------------------------------------------------------
 
-fn parse_list(lex: &mut Lexer<'_>) -> Block {
+fn parse_list(lex: &mut Lexer<'_>, table: &TagTable) -> Block {
     let first_span = lex.peek().span;
+    let source = lex.source();
     let list_kind = match &lex.peek().kind {
         Token::ListMarker { ordered, .. } => {
             if *ordered {
@@ -618,13 +649,20 @@ fn parse_list(lex: &mut Lexer<'_>) -> Block {
                 Some(build_inline_content(
                     desc_text,
                     sub_span(item_span, &raw, desc_text),
+                    source,
+                    table,
                 )),
             )
         } else {
             (content_text, None)
         };
 
-        let content = build_inline_content(term_text, sub_span(item_span, &raw, term_text));
+        let content = build_inline_content(
+            term_text,
+            sub_span(item_span, &raw, term_text),
+            source,
+            table,
+        );
 
         flat_items.push(ListItem {
             checkbox,
@@ -724,13 +762,14 @@ fn parse_list_item_content(text: &str) -> (Option<Checkbox>, &str) {
 // Table
 // ---------------------------------------------------------------------------
 
-fn parse_table(lex: &mut Lexer<'_>) -> Block {
+fn parse_table(lex: &mut Lexer<'_>, table: &TagTable) -> Block {
     let first_span = lex.peek().span;
+    let source = lex.source();
     lex.advance(); // consume TableRow
     let first_raw = consume_raw_line(lex);
     skip_newline(lex);
 
-    let headers = parse_table_row_content(&first_raw, first_span);
+    let headers = parse_table_row_content(&first_raw, first_span, source, table);
     let mut alignments = Vec::new();
     let mut rows: Vec<Vec<InlineContent>> = Vec::new();
     let mut last_span = first_span;
@@ -756,7 +795,7 @@ fn parse_table(lex: &mut Lexer<'_>) -> Block {
         lex.advance();
         let raw = consume_raw_line(lex);
         skip_newline(lex);
-        rows.push(parse_table_row_content(&raw, row_span));
+        rows.push(parse_table_row_content(&raw, row_span, source, table));
         last_span = row_span;
     }
 
@@ -772,7 +811,12 @@ fn parse_table(lex: &mut Lexer<'_>) -> Block {
     })
 }
 
-fn parse_table_row_content(line: &str, span: Span) -> Vec<InlineContent> {
+fn parse_table_row_content(
+    line: &str,
+    span: Span,
+    source: &str,
+    table: &TagTable,
+) -> Vec<InlineContent> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
     let inner = inner.strip_suffix('|').unwrap_or(inner);
@@ -780,7 +824,7 @@ fn parse_table_row_content(line: &str, span: Span) -> Vec<InlineContent> {
         .split('|')
         .map(|cell| {
             let cell = cell.trim();
-            build_inline_content(cell, sub_span(span, line, cell))
+            build_inline_content(cell, sub_span(span, line, cell), source, table)
         })
         .collect()
 }
@@ -952,21 +996,25 @@ fn parse_block_comment(lex: &mut Lexer<'_>) -> Block {
 // Footnote definition
 // ---------------------------------------------------------------------------
 
-fn parse_footnote_def(lex: &mut Lexer<'_>) -> Block {
+fn parse_footnote_def(lex: &mut Lexer<'_>, table: &TagTable) -> Block {
     let tok = lex.advance();
     let span = tok.span;
     let label = match &tok.kind {
         Token::FootnoteDefStart { label } => label.clone(),
         _ => unreachable!(),
     };
+    let source = lex.source();
     let raw = consume_raw_line(lex);
     skip_newline(lex);
 
     let prefix = format!("[^{label}]: ");
     let content = match raw.trim().strip_prefix(&prefix) {
-        Some(content_text) => {
-            build_inline_content(content_text, sub_span(span, &raw, content_text))
-        }
+        Some(content_text) => build_inline_content(
+            content_text,
+            sub_span(span, &raw, content_text),
+            source,
+            table,
+        ),
         None => InlineContent::empty(),
     };
 
@@ -981,7 +1029,7 @@ fn parse_footnote_def(lex: &mut Lexer<'_>) -> Block {
 // Block tag
 // ---------------------------------------------------------------------------
 
-fn parse_block_tag(lex: &mut Lexer<'_>) -> Block {
+fn parse_block_tag(lex: &mut Lexer<'_>, table: &TagTable) -> Block {
     let tok = lex.advance();
     let span = tok.span;
 
@@ -990,6 +1038,8 @@ fn parse_block_tag(lex: &mut Lexer<'_>) -> Block {
         Token::UnknownTag { name } => name.clone(),
         _ => unreachable!(),
     };
+
+    let source = lex.source();
 
     // Consume optional argument
     let arg_string = if matches!(lex.peek().kind, Token::TagArg(_)) {
@@ -1003,15 +1053,39 @@ fn parse_block_tag(lex: &mut Lexer<'_>) -> Block {
     };
     skip_newline(lex);
 
-    Block::BlockTag(tags::parse_tag(&name, arg_string.as_deref(), span))
+    // Recover the argument's absolute span. The block lexer gives TagArg the
+    // whole line's span, but the argument is the line's trimmed tail (the
+    // block path does no escape rewriting), so it occupies the last
+    // `arg.len()` bytes before trailing whitespace.
+    let raw_arg = arg_string.as_deref().and_then(|arg| {
+        let line = source.get(span.start..span.end)?;
+        let end = span.start + line.trim_end().len();
+        let start = end.checked_sub(arg.len())?;
+        let raw = source.get(start..end)?;
+        if raw != arg {
+            debug_assert!(false, "block tag argument does not line up with source");
+            return None;
+        }
+        let col = span.col + (start - span.start) as u32;
+        Some((raw, Span::new(start, end, span.line, col)))
+    });
+
+    Block::BlockTag(tags::parse_tag_with(
+        &name,
+        arg_string.as_deref(),
+        raw_arg,
+        span,
+        table,
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Paragraph
 // ---------------------------------------------------------------------------
 
-fn parse_paragraph(lex: &mut Lexer<'_>) -> Option<Block> {
+fn parse_paragraph(lex: &mut Lexer<'_>, table: &TagTable) -> Option<Block> {
     let first_span = lex.peek().span;
+    let source = lex.source();
     let mut text_lines: Vec<String> = Vec::new();
     let mut last_span = first_span;
 
@@ -1036,7 +1110,7 @@ fn parse_paragraph(lex: &mut Lexer<'_>) -> Option<Block> {
 
     let full_text = text_lines.join("\n");
     let span = first_span.merge(last_span);
-    let content = build_inline_content(&full_text, span);
+    let content = build_inline_content(&full_text, span, source, table);
 
     Some(Block::Paragraph(Paragraph { content, span }))
 }
@@ -1062,9 +1136,9 @@ fn sub_span(outer: Span, raw: &str, sub: &str) -> Span {
     )
 }
 
-fn build_inline_content(text: &str, span: Span) -> InlineContent {
+fn build_inline_content(text: &str, span: Span, source: &str, table: &TagTable) -> InlineContent {
     let tokens = lexer::tokenize_inline(text, span);
-    tokens_to_inline_content(&tokens)
+    tokens_to_inline_content(&tokens, source, table)
 }
 
 /// Build an inline segment for a delimited run (bold/italic/strikethrough).
@@ -1080,7 +1154,11 @@ fn delimited_span(open_span: Span, inner: &[crate::tokens::Spanned], close: Opti
     }
 }
 
-fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent {
+fn tokens_to_inline_content(
+    tokens: &[crate::tokens::Spanned],
+    source: &str,
+    table: &TagTable,
+) -> InlineContent {
     let mut segments: Vec<InlineSegment> = Vec::new();
     let mut i = 0;
 
@@ -1105,7 +1183,7 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent 
                 let inner_end = find_matching_delim(&tokens[i..], Token::BoldDelim);
                 let inner_toks = &tokens[i..i + inner_end];
                 let close = tokens.get(i + inner_end).map(|t| t.span);
-                let inner = tokens_to_inline_content(inner_toks);
+                let inner = tokens_to_inline_content(inner_toks, source, table);
                 push(
                     InlineKind::Bold(inner),
                     delimited_span(tok_span, inner_toks, close),
@@ -1117,7 +1195,7 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent 
                 let inner_end = find_matching_delim(&tokens[i..], Token::ItalicDelim);
                 let inner_toks = &tokens[i..i + inner_end];
                 let close = tokens.get(i + inner_end).map(|t| t.span);
-                let inner = tokens_to_inline_content(inner_toks);
+                let inner = tokens_to_inline_content(inner_toks, source, table);
                 push(
                     InlineKind::Italic(inner),
                     delimited_span(tok_span, inner_toks, close),
@@ -1129,7 +1207,7 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent 
                 let inner_end = find_matching_delim(&tokens[i..], Token::StrikethroughDelim);
                 let inner_toks = &tokens[i..i + inner_end];
                 let close = tokens.get(i + inner_end).map(|t| t.span);
-                let inner = tokens_to_inline_content(inner_toks);
+                let inner = tokens_to_inline_content(inner_toks, source, table);
                 push(
                     InlineKind::Strikethrough(inner),
                     delimited_span(tok_span, inner_toks, close),
@@ -1143,7 +1221,7 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent 
                 meta,
             } => {
                 let (link_tags, attrs) = match meta.as_deref() {
-                    Some(m) => parse_metadata(m, tok_span),
+                    Some(m) => parse_metadata(m, tok_span, table),
                     None => (Vec::new(), HashMap::new()),
                 };
                 push(
@@ -1174,13 +1252,16 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent 
             }
             Token::Tag(kw) => {
                 let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
-                let tag = tags::parse_tag(kw.as_str(), arg, span);
+                let raw_arg = raw_tag_arg(&arg, source);
+                let tag =
+                    tags::parse_tag_with(kw.as_str(), arg.map(|(a, _)| a), raw_arg, span, table);
                 push(InlineKind::Tag(tag), span);
                 i += 1;
             }
             Token::UnknownTag { name } => {
                 let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
-                let tag = tags::parse_tag(name, arg, span);
+                let raw_arg = raw_tag_arg(&arg, source);
+                let tag = tags::parse_tag_with(name, arg.map(|(a, _)| a), raw_arg, span, table);
                 push(InlineKind::Tag(tag), span);
                 i += 1;
             }
@@ -1199,20 +1280,30 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent 
 }
 
 /// If the token after `*i` is a `TagArg`, consume it and return the argument
-/// text plus the tag span extended to cover the argument.
+/// text with its own span, plus the tag span extended to cover the argument.
 fn take_tag_arg<'a>(
     tokens: &'a [crate::tokens::Spanned],
     i: &mut usize,
     tag_span: Span,
-) -> (Option<&'a str>, Span) {
+) -> (Option<(&'a str, Span)>, Span) {
     if let Some(next) = tokens.get(*i + 1)
         && let Token::TagArg(a) = &next.kind
     {
         *i += 1;
-        (Some(a.as_str()), tag_span.merge(next.span))
+        (Some((a.as_str(), next.span)), tag_span.merge(next.span))
     } else {
         (None, tag_span)
     }
+}
+
+/// The raw source slice behind an inline tag argument. The inline lexer's
+/// `TagArg` span is the trimmed raw byte range, so slicing the source there
+/// recovers the argument before escape processing (`\#` stays two bytes),
+/// which is what custom-tag field spans must be measured against.
+fn raw_tag_arg<'a>(arg: &Option<(&str, Span)>, source: &'a str) -> Option<(&'a str, Span)> {
+    let (_, arg_span) = arg.as_ref()?;
+    let raw = source.get(arg_span.start..arg_span.end)?;
+    Some((raw, *arg_span))
 }
 
 fn find_matching_delim(tokens: &[crate::tokens::Spanned], delim: Token) -> usize {
@@ -2210,5 +2301,321 @@ mod tests {
         } else {
             panic!("expected nested list");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // User-defined tag interpretation (TagTable, plan §10 T1)
+    // -----------------------------------------------------------------------
+
+    use crate::tag_table::{CustomArgKind, TagDeclaration, TagTable};
+    use crate::tags::CustomField;
+
+    fn book_table() -> TagTable {
+        TagTable::build([TagDeclaration {
+            name: "book".to_string(),
+            pattern: Some(r#""(?<title>[^"]+)"\s+by\s+(?<author>.+)"#.to_string()),
+            kind: None,
+        }])
+        .unwrap()
+    }
+
+    fn kind_table(name: &str, kind: CustomArgKind) -> TagTable {
+        TagTable::build([TagDeclaration {
+            name: name.to_string(),
+            pattern: None,
+            kind: Some(kind),
+        }])
+        .unwrap()
+    }
+
+    /// Every tag in the document, in depth-first order.
+    fn all_tags(doc: &Document) -> Vec<&Tag> {
+        fn walk<'a>(block: &'a Block, out: &mut Vec<&'a Tag>) {
+            match block {
+                Block::BlockTag(tag) => out.push(tag),
+                Block::Heading(h) => out.extend(h.content.tags()),
+                Block::Paragraph(p) => out.extend(p.content.tags()),
+                Block::List(l) => {
+                    for item in &l.items {
+                        out.extend(item.content.tags());
+                        for child in &item.children {
+                            walk(child, out);
+                        }
+                    }
+                }
+                Block::Callout(c) => {
+                    out.extend(c.tags.iter());
+                    for child in &c.content {
+                        walk(child, out);
+                    }
+                }
+                Block::CodeBlock(cb) => out.extend(cb.tags.iter()),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for block in &doc.children {
+            walk(block, &mut out);
+        }
+        out
+    }
+
+    fn expect_custom<'a>(tag: &'a Tag, name: &str) -> (&'a Vec<CustomField>, bool) {
+        match &tag.kind {
+            TagKind::Custom {
+                name: n,
+                fields,
+                shape_mismatch,
+                ..
+            } if n == name => (fields, *shape_mismatch),
+            other => panic!("expected custom tag #{name}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_custom_block_tag_pattern_fields_span_exact() {
+        let src = "#book \"Dune\" by Frank Herbert\n";
+        let result = parse_document_with(src, &book_table());
+        assert!(result.errors.is_empty());
+
+        let tags = all_tags(&result.document);
+        assert_eq!(tags.len(), 1);
+        let (fields, mismatch) = expect_custom(tags[0], "book");
+        assert!(!mismatch);
+        assert_eq!(fields.len(), 2);
+
+        assert_eq!(fields[0].group, "title");
+        assert_eq!(fields[0].value, "Dune");
+        assert_eq!(slice(src, &fields[0].span), "Dune");
+
+        assert_eq!(fields[1].group, "author");
+        assert_eq!(fields[1].value, "Frank Herbert");
+        assert_eq!(slice(src, &fields[1].span), "Frank Herbert");
+        assert_eq!(fields[1].span.line, 1);
+        // `#book "Dune" by ` is 16 bytes; cols are 1-based byte columns.
+        assert_eq!(fields[1].span.col, 17);
+    }
+
+    #[test]
+    fn test_custom_block_tag_indented_line() {
+        // classify_line trims, so an indented block tag's argument span must
+        // still line up with the source.
+        let src = "   #book \"Dune\" by Frank Herbert  \n";
+        let result = parse_document_with(src, &book_table());
+        let tags = all_tags(&result.document);
+        let (fields, mismatch) = expect_custom(tags[0], "book");
+        assert!(!mismatch);
+        assert_eq!(slice(src, &fields[0].span), "Dune");
+        assert_eq!(slice(src, &fields[1].span), "Frank Herbert");
+    }
+
+    #[test]
+    fn test_custom_inline_tag_pattern_fields_span_exact() {
+        let src = "# Reading\n\nTonight: #book \"Dune\" by Frank Herbert\n";
+        let result = parse_document_with(src, &book_table());
+        assert!(result.errors.is_empty());
+
+        let tags = all_tags(&result.document);
+        assert_eq!(tags.len(), 1);
+        let (fields, mismatch) = expect_custom(tags[0], "book");
+        assert!(!mismatch);
+        assert_eq!(slice(src, &fields[0].span), "Dune");
+        assert_eq!(slice(src, &fields[1].span), "Frank Herbert");
+        assert_eq!(fields[1].span.line, 3);
+    }
+
+    #[test]
+    fn test_custom_tag_multibyte_argument() {
+        // Multi-byte text before the tag and inside both capture groups.
+        let src = "café notes: #book \"砂の惑星\" by フランク・ハーバート\n";
+        let result = parse_document_with(src, &book_table());
+        assert!(result.errors.is_empty());
+
+        let tags = all_tags(&result.document);
+        let (fields, mismatch) = expect_custom(tags[0], "book");
+        assert!(!mismatch);
+        assert_eq!(fields[0].value, "砂の惑星");
+        assert_eq!(slice(src, &fields[0].span), "砂の惑星");
+        assert_eq!(fields[1].value, "フランク・ハーバート");
+        assert_eq!(slice(src, &fields[1].span), "フランク・ハーバート");
+    }
+
+    #[test]
+    fn test_custom_tag_in_list_item() {
+        let src = "- read #book \"Dune\" by Frank Herbert\n";
+        let result = parse_document_with(src, &book_table());
+        let tags = all_tags(&result.document);
+        assert_eq!(tags.len(), 1);
+        let (fields, _) = expect_custom(tags[0], "book");
+        assert_eq!(slice(src, &fields[0].span), "Dune");
+    }
+
+    #[test]
+    fn test_custom_tag_escaped_hash_matches_raw_argument() {
+        // `\#` lexes into the argument as `#`, but the raw source slice (what
+        // patterns match against and spans measure) keeps both bytes.
+        let src = "note #book \"Du\\#ne\" by X\n";
+        let result = parse_document_with(src, &book_table());
+        let tags = all_tags(&result.document);
+        let (fields, mismatch) = expect_custom(tags[0], "book");
+        assert!(!mismatch);
+        assert_eq!(fields[0].value, "Du\\#ne");
+        assert_eq!(slice(src, &fields[0].span), "Du\\#ne");
+    }
+
+    #[test]
+    fn test_custom_tag_shape_mismatch_keeps_document_shape() {
+        let src = "#book Dune without quotes\n\nText with #book inline.\n";
+        let with_table = parse_document_with(src, &book_table());
+        let without_table = parse_document(src);
+
+        assert!(with_table.errors.is_empty());
+        // Same block structure as the untabled parse — only the tag kinds
+        // differ (Custom vs Unknown).
+        assert_eq!(
+            with_table.document.children.len(),
+            without_table.document.children.len()
+        );
+
+        let tags = all_tags(&with_table.document);
+        assert_eq!(tags.len(), 2);
+        for tag in &tags {
+            let (fields, mismatch) = expect_custom(tag, "book");
+            assert!(mismatch, "expected shape mismatch for {:?}", tag.kind);
+            assert!(fields.is_empty());
+        }
+        // The raw argument survives on the mismatching tag.
+        assert!(matches!(
+            &tags[0].kind,
+            TagKind::Custom { raw: Some(r), .. } if r == "Dune without quotes"
+        ));
+        // Spans are untouched by the table.
+        assert_eq!(slice(src, &tags[0].span), "#book Dune without quotes");
+    }
+
+    #[test]
+    fn test_custom_kind_duration() {
+        let table = kind_table("reading-time", CustomArgKind::Duration);
+        // 90m canonicalizes to 1h30m; the span still slices the source text.
+        let src = "#reading-time 90m\n";
+        let result = parse_document_with(src, &table);
+        let tags = all_tags(&result.document);
+        let (fields, mismatch) = expect_custom(tags[0], "reading-time");
+        assert!(!mismatch);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].group, "duration");
+        assert_eq!(fields[0].value, "1h30m");
+        assert_eq!(slice(src, &fields[0].span), "90m");
+
+        let bad = parse_document_with("#reading-time ages\n", &table);
+        let tags = all_tags(&bad.document);
+        let (fields, mismatch) = expect_custom(tags[0], "reading-time");
+        assert!(mismatch);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn test_custom_kind_date_and_timestamp() {
+        let table = kind_table("published", CustomArgKind::Date);
+        let src = "#published 2026-04-10T14:00\n";
+        let result = parse_document_with(src, &table);
+        let (fields, mismatch) = expect_custom(all_tags(&result.document)[0], "published");
+        assert!(!mismatch);
+        assert_eq!(fields[0].group, "date");
+        // date canonicalizes away the time component...
+        assert_eq!(fields[0].value, "2026-04-10");
+        assert_eq!(slice(src, &fields[0].span), "2026-04-10T14:00");
+
+        // ...while timestamp keeps it.
+        let table = kind_table("met", CustomArgKind::Timestamp);
+        let src = "#met 2026-04-10T14:00\n";
+        let result = parse_document_with(src, &table);
+        let (fields, mismatch) = expect_custom(all_tags(&result.document)[0], "met");
+        assert!(!mismatch);
+        assert_eq!(fields[0].group, "timestamp");
+        assert_eq!(fields[0].value, "2026-04-10 14:00");
+
+        let bad = parse_document_with("#met not-a-date\n", &table);
+        let (fields, mismatch) = expect_custom(all_tags(&bad.document)[0], "met");
+        assert!(mismatch);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn test_custom_kind_slug() {
+        let table = kind_table("sect", CustomArgKind::Slug);
+        let src = "#sect intro-claim\n";
+        let result = parse_document_with(src, &table);
+        let (fields, mismatch) = expect_custom(all_tags(&result.document)[0], "sect");
+        assert!(!mismatch);
+        assert_eq!(fields[0].group, "slug");
+        assert_eq!(fields[0].value, "intro-claim");
+        assert_eq!(slice(src, &fields[0].span), "intro-claim");
+
+        let bad = parse_document_with("#sect has space\n", &table);
+        let (fields, mismatch) = expect_custom(all_tags(&bad.document)[0], "sect");
+        assert!(mismatch);
+        assert!(fields.is_empty());
+    }
+
+    #[test]
+    fn test_custom_tag_without_argument() {
+        // No argument: the pattern decides against the empty string.
+        let table = book_table();
+        let result = parse_document_with("#book\n", &table);
+        let (fields, mismatch) = expect_custom(all_tags(&result.document)[0], "book");
+        assert!(mismatch);
+        assert!(fields.is_empty());
+
+        // A pattern that matches the empty string is satisfied by it.
+        let optional = TagTable::build([TagDeclaration {
+            name: "flagged".to_string(),
+            pattern: Some("(?<why>.*)".to_string()),
+            kind: None,
+        }])
+        .unwrap();
+        let result = parse_document_with("#flagged\n", &optional);
+        let (fields, mismatch) = expect_custom(all_tags(&result.document)[0], "flagged");
+        assert!(!mismatch);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, "");
+    }
+
+    #[test]
+    fn test_custom_tag_in_callout_content() {
+        // The table threads through recursive callout parsing.
+        let src = "> [!note] reading\n> #book \"Dune\" by Frank Herbert\n";
+        let result = parse_document_with(src, &book_table());
+        let tags = all_tags(&result.document);
+        let (fields, mismatch) = expect_custom(tags[0], "book");
+        assert!(!mismatch);
+        assert_eq!(fields[0].value, "Dune");
+        assert_eq!(fields[1].value, "Frank Herbert");
+    }
+
+    #[test]
+    fn test_undeclared_tags_stay_unknown_with_table() {
+        let src = "#movie \"Dune\" by Villeneuve\n";
+        let result = parse_document_with(src, &book_table());
+        let tags = all_tags(&result.document);
+        assert!(matches!(&tags[0].kind, TagKind::Unknown { name, .. } if name == "movie"));
+    }
+
+    #[test]
+    fn test_parse_document_with_empty_table_is_parse_document() {
+        // Zero behavior change: identical AST and errors on a document that
+        // exercises every construct, including unknown (undeclared) tags.
+        let src = "---\ntitle: Test\n---\n\n# Heading #custom arg\n\nText **bold** with #todo and #unknowntag value here.\n\n- item #book \"Dune\" by X\n\n> [!note] #custom\n> inner\n\n```rust #tangle file=x.rs\ncode\n```\n\n#deadline 2026-04-10\n#book \"Dune\" by Frank Herbert\n";
+        let plain = parse_document(src);
+        let with_empty = parse_document_with(src, &TagTable::empty());
+        assert_eq!(plain.document, with_empty.document);
+        assert_eq!(plain.errors.len(), with_empty.errors.len());
+
+        // And a table whose declarations never fire leaves a custom-tag-free
+        // document untouched.
+        let src = "# Plain\n\nJust text with #todo and #deadline 2026-04-10.\n";
+        let plain = parse_document(src);
+        let with_table = parse_document_with(src, &book_table());
+        assert_eq!(plain.document, with_table.document);
     }
 }
