@@ -100,6 +100,7 @@ Tags are prefixed with `#` (no space -- a space after `#` makes it a heading). E
 | `morg purchases` | Aggregated purchase list with totals |
 | `morg time` | Time tracking report |
 | `morg search` | Full-text and tag search |
+| `morg tags` | Tabulate a custom tag declared in `[tags]` config |
 | `morg lint` | Validate documents |
 | `morg export` | Markdown to HTML |
 | `morg ical` | Export to iCalendar |
