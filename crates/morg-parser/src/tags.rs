@@ -65,6 +65,11 @@ pub enum TagKind {
     },
     /// A tracked purchase, e.g. `#purchase USB-C cable price=12.99 category=cables`.
     Purchase(PurchaseValue),
+    /// A stable block address, e.g. `#anchor intro-claim`. The name is a
+    /// slug: ASCII alphanumerics, `-`, and `_`, starting with an alphanumeric.
+    Anchor {
+        name: String,
+    },
     /// A custom TODO workflow state defined in frontmatter.
     CustomState {
         name: String,
@@ -444,6 +449,10 @@ pub fn parse_tag(name: &str, arg: Option<&str>, span: Span) -> Tag {
             Some(value) => TagKind::Purchase(value),
             None => unknown(name, arg),
         },
+        Some(Keyword::Anchor) => match parse_anchor(arg) {
+            Some(anchor_name) => TagKind::Anchor { name: anchor_name },
+            None => unknown(name, arg),
+        },
         // Properties/End are structural, not inline tags — treat as unknown if used as tags
         Some(Keyword::Properties) | Some(Keyword::End) => unknown(name, arg),
         None => unknown(name, arg),
@@ -702,6 +711,25 @@ fn split_media_args(s: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+/// Parse a `#anchor` argument into a slug-shaped anchor name: ASCII
+/// alphanumerics, `-`, and `_`, starting with an alphanumeric. Returns `None`
+/// for anything else (empty, whitespace, non-ASCII) so the caller falls back
+/// to an unknown tag.
+fn parse_anchor(arg: Option<&str>) -> Option<String> {
+    let s = arg?.trim();
+    let first = s.bytes().next()?;
+    if !first.is_ascii_alphanumeric() {
+        return None;
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(s.to_string())
 }
 
 fn parse_datetime(arg: Option<&str>) -> Option<NaiveDateTime> {
@@ -1228,6 +1256,39 @@ mod tests {
         assert_eq!(parse_money("abc"), None);
         assert_eq!(parse_money("1.999"), None);
         assert_eq!(parse_money(""), None);
+    }
+
+    #[test]
+    fn test_parse_anchor() {
+        let tag = parse_tag("anchor", Some("intro-claim"), Span::empty(1, 1));
+        assert!(matches!(tag.kind, TagKind::Anchor { ref name } if name == "intro-claim"));
+
+        // Underscores, digits, and a disambiguation-style suffix are fine.
+        let tag = parse_tag("anchor", Some("evidence_2021-1"), Span::empty(1, 1));
+        assert!(matches!(tag.kind, TagKind::Anchor { ref name } if name == "evidence_2021-1"));
+
+        // Surrounding whitespace is trimmed.
+        let tag = parse_tag("anchor", Some("  note1  "), Span::empty(1, 1));
+        assert!(matches!(tag.kind, TagKind::Anchor { ref name } if name == "note1"));
+    }
+
+    #[test]
+    fn test_parse_anchor_invalid_falls_back() {
+        // Missing, empty, non-slug, or non-ASCII names fall back to Unknown.
+        for arg in [
+            None,
+            Some(""),
+            Some("has space"),
+            Some("-leading"),
+            Some("café"),
+        ] {
+            let tag = parse_tag("anchor", arg, Span::empty(1, 1));
+            assert!(
+                matches!(tag.kind, TagKind::Unknown { ref name, .. } if name == "anchor"),
+                "expected fallback for {arg:?}, got {:?}",
+                tag.kind
+            );
+        }
     }
 
     #[test]

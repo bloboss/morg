@@ -17,7 +17,7 @@ pub fn run(
         let title = parsed
             .first()
             .and_then(|pf| pf.document.frontmatter.as_ref())
-            .and_then(|fm| fm.data.get("title"))
+            .and_then(|fm| fm.data.as_mapping_get("title"))
             .and_then(|v| v.as_str())
             .unwrap_or("morg document");
 
@@ -191,28 +191,28 @@ fn render_inline(content: &InlineContent, out: &mut String) {
 }
 
 fn render_inline_segment(seg: &InlineSegment, out: &mut String) {
-    match seg {
-        InlineSegment::Text(t) => out.push_str(&escape_html(t)),
-        InlineSegment::Tag(tag) => render_inline_tag(tag, out),
-        InlineSegment::Bold(inner) => {
+    match &seg.kind {
+        InlineKind::Text(t) => out.push_str(&escape_html(t)),
+        InlineKind::Tag(tag) => render_inline_tag(tag, out),
+        InlineKind::Bold(inner) => {
             out.push_str("<strong>");
             render_inline(inner, out);
             out.push_str("</strong>");
         }
-        InlineSegment::Italic(inner) => {
+        InlineKind::Italic(inner) => {
             out.push_str("<em>");
             render_inline(inner, out);
             out.push_str("</em>");
         }
-        InlineSegment::Strikethrough(inner) => {
+        InlineKind::Strikethrough(inner) => {
             out.push_str("<del>");
             render_inline(inner, out);
             out.push_str("</del>");
         }
-        InlineSegment::Code(c) => {
+        InlineKind::Code(c) => {
             out.push_str(&format!("<code>{}</code>", escape_html(c)));
         }
-        InlineSegment::Link(link) => {
+        InlineKind::Link(link) => {
             let title_attr = link
                 .title
                 .as_deref()
@@ -225,9 +225,20 @@ fn render_inline_segment(seg: &InlineSegment, out: &mut String) {
                 escape_html(&link.text),
             ));
         }
-        InlineSegment::FootnoteRef(label) => {
+        InlineKind::FootnoteRef(label) => {
             out.push_str(&format!(
                 "<sup><a id=\"fnref-{label}\" href=\"#fn-{label}\">{label}</a></sup>"
+            ));
+        }
+        InlineKind::Cite { key, locator } => {
+            let text = match locator {
+                Some(loc) => format!("[@{key}, {loc}]"),
+                None => format!("[@{key}]"),
+            };
+            out.push_str(&format!(
+                "<span class=\"cite\" data-cite-key=\"{}\">{}</span>",
+                escape_html(key),
+                escape_html(&text),
             ));
         }
     }

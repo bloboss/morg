@@ -53,10 +53,9 @@ fn parse_frontmatter(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Optio
         return None;
     }
 
+    let source = lex.source();
     let open_span = lex.advance().span;
     skip_newline(lex);
-
-    let mut yaml_lines: Vec<String> = Vec::new();
 
     loop {
         if lex.is_eof() {
@@ -73,11 +72,23 @@ fn parse_frontmatter(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Optio
             let close_span = lex.advance().span;
             skip_newline(lex);
 
-            let raw = yaml_lines.join("\n");
+            // Slice the YAML text straight from the source (between the
+            // newline after the opening `---` and the newline before the
+            // closing one) so parsed markers line up with file offsets.
+            let content_start = (open_span.end + 1).min(close_span.start);
+            let content_end = close_span.start.saturating_sub(1).max(content_start);
+            let raw = source[content_start..content_end].to_string();
             let span = open_span.merge(close_span);
 
-            match serde_yaml::from_str(&raw) {
-                Ok(data) => return Some(Frontmatter { raw, data, span }),
+            match load_frontmatter_yaml(&raw, content_start, open_span.line + 1) {
+                Ok((data, entries)) => {
+                    return Some(Frontmatter {
+                        raw,
+                        data,
+                        entries,
+                        span,
+                    });
+                }
                 Err(e) => {
                     errors.push(ParseError {
                         kind: ParseErrorKind::InvalidYaml,
@@ -89,9 +100,172 @@ fn parse_frontmatter(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Optio
             }
         }
 
-        // Collect raw line content
-        let raw = extract_raw_line(lex);
-        yaml_lines.push(raw);
+        lex.skip_to_next_line();
+    }
+}
+
+/// Parse frontmatter YAML with `saphyr`, returning the plain value tree plus
+/// per-entry spans for the top-level mapping.
+///
+/// `base_offset` is the absolute byte offset of `raw`'s first byte in the
+/// source; `base_line` its 1-based line. Saphyr markers are char-indexed
+/// into `raw`, so they are mapped back to byte offsets before being
+/// absolutized.
+fn load_frontmatter_yaml(
+    raw: &str,
+    base_offset: usize,
+    base_line: u32,
+) -> Result<(saphyr::YamlOwned, Vec<FrontmatterEntry>), saphyr::ScanError> {
+    use saphyr::{LoadableYamlNode, MarkedYamlOwned, ScalarOwned, YamlDataOwned, YamlOwned};
+
+    let mut docs = MarkedYamlOwned::load_from_str(raw)?;
+    if docs.is_empty() {
+        // Empty or comment-only frontmatter — same as YAML `null`.
+        return Ok((YamlOwned::Value(ScalarOwned::Null), Vec::new()));
+    }
+    let marked = docs.remove(0);
+
+    let cx = YamlSpanCx {
+        raw,
+        // Char index (saphyr markers) → byte offset in `raw`.
+        char_to_byte: raw
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain(std::iter::once(raw.len()))
+            .collect(),
+        base_offset,
+        base_line,
+    };
+
+    let mut entries = Vec::new();
+    if let YamlDataOwned::Mapping(map) = &marked.data {
+        for (k, v) in map {
+            let Some((key, key_span)) = cx.key(k) else {
+                continue; // non-string key — no typed entry for it
+            };
+            let value = cx.node(v);
+
+            entries.push(FrontmatterEntry {
+                key,
+                key_span,
+                value_span: value.span,
+                value,
+            });
+        }
+    }
+
+    Ok((marked_to_plain(marked), entries))
+}
+
+/// Maps saphyr's char-indexed markers on `raw` back to [`Span`]s with
+/// absolute byte offsets into the document source.
+struct YamlSpanCx<'a> {
+    raw: &'a str,
+    char_to_byte: Vec<usize>,
+    /// Absolute byte offset of `raw`'s first byte in the source.
+    base_offset: usize,
+    /// 1-based line of `raw`'s first line in the source.
+    base_line: u32,
+}
+
+impl YamlSpanCx<'_> {
+    fn to_byte(&self, char_idx: usize) -> usize {
+        self.char_to_byte
+            .get(char_idx)
+            .copied()
+            .unwrap_or(self.raw.len())
+    }
+
+    fn abs_span(&self, start_b: usize, end_b: usize) -> Span {
+        let prefix = &self.raw[..start_b];
+        let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        Span::new(
+            self.base_offset + start_b,
+            self.base_offset + end_b,
+            self.base_line + prefix.matches('\n').count() as u32,
+            (start_b - line_start) as u32 + 1,
+        )
+    }
+
+    /// The string key and its span, or `None` for a non-string key.
+    fn key(&self, k: &saphyr::MarkedYamlOwned) -> Option<(String, Span)> {
+        let key = k.data.as_str()?;
+        let span = self.abs_span(
+            self.to_byte(k.span.start.index()),
+            self.to_byte(k.span.end.index()),
+        );
+        Some((key.to_string(), span))
+    }
+
+    /// Build the span-annotated node tree for a marked YAML value.
+    fn node(&self, v: &saphyr::MarkedYamlOwned) -> FrontmatterNode {
+        use saphyr::YamlDataOwned;
+
+        // The value's end marker may extend past the value text (e.g.
+        // over the newline after a block sequence); trim it back.
+        let start = self.to_byte(v.span.start.index());
+        let mut end = self.to_byte(v.span.end.index()).max(start);
+        // For flow collections the end marker instead points AT the closing
+        // delimiter, leaving it outside the exclusive range; take it back in
+        // so the span covers the full `[...]`/`{...}` markup.
+        for (open, close, is_kind) in [
+            ('[', ']', matches!(v.data, YamlDataOwned::Sequence(_))),
+            ('{', '}', matches!(v.data, YamlDataOwned::Mapping(_))),
+        ] {
+            if is_kind && self.raw[start..].starts_with(open) && self.raw[end..].starts_with(close)
+            {
+                end += close.len_utf8();
+            }
+        }
+        let end = start + self.raw[start..end].trim_end().len();
+        let span = self.abs_span(start, end);
+
+        let kind = match &v.data {
+            YamlDataOwned::Sequence(items) => {
+                FrontmatterNodeKind::Seq(items.iter().map(|item| self.node(item)).collect())
+            }
+            YamlDataOwned::Mapping(map) => FrontmatterNodeKind::Map(
+                map.iter()
+                    .filter_map(|(k, inner)| {
+                        let (key, key_span) = self.key(k)?;
+                        Some(FrontmatterMapEntry {
+                            key,
+                            key_span,
+                            value: self.node(inner),
+                        })
+                    })
+                    .collect(),
+            ),
+            // A tagged node keeps the outer span (tag markup included) but
+            // takes its shape from the inner value.
+            YamlDataOwned::Tagged(_, inner) => self.node(inner).kind,
+            _ => FrontmatterNodeKind::Scalar,
+        };
+
+        FrontmatterNode { span, kind }
+    }
+}
+
+/// Strip span annotations from a `MarkedYamlOwned` tree, yielding the plain
+/// `YamlOwned` stored on the AST.
+fn marked_to_plain(node: saphyr::MarkedYamlOwned) -> saphyr::YamlOwned {
+    use saphyr::{YamlDataOwned, YamlOwned};
+    match node.data {
+        YamlDataOwned::Representation(s, style, tag) => YamlOwned::Representation(s, style, tag),
+        YamlDataOwned::Value(scalar) => YamlOwned::Value(scalar),
+        YamlDataOwned::Sequence(seq) => {
+            YamlOwned::Sequence(seq.into_iter().map(marked_to_plain).collect())
+        }
+        YamlDataOwned::Mapping(map) => YamlOwned::Mapping(
+            map.into_iter()
+                .map(|(k, v)| (marked_to_plain(k), marked_to_plain(v)))
+                .collect(),
+        ),
+        YamlDataOwned::Tagged(tag, inner) => {
+            YamlOwned::Tagged(tag, Box::new(marked_to_plain(*inner)))
+        }
+        YamlDataOwned::Alias(id) => YamlOwned::Alias(id),
+        YamlDataOwned::BadValue => YamlOwned::BadValue,
     }
 }
 
@@ -132,7 +306,7 @@ fn parse_block(lex: &mut Lexer<'_>, errors: &mut Vec<ParseError>) -> Option<Bloc
             let span = lex.advance().span;
             skip_newline(lex);
             Some(Block::Paragraph(Paragraph {
-                content: InlineContent::plain("---"),
+                content: InlineContent::plain("---", span),
                 span,
             }))
         }
@@ -166,7 +340,7 @@ fn parse_heading(lex: &mut Lexer<'_>, level: u8, errors: &mut Vec<ParseError>) -
     let text = raw.trim_start();
     let content_start = text.find(' ').map(|i| i + 1).unwrap_or(text.len());
     let content_text = &text[content_start..];
-    let content = build_inline_content(content_text, head_span);
+    let content = build_inline_content(content_text, sub_span(head_span, &raw, content_text));
 
     // Look ahead for property drawer
     let saved = lex.position();
@@ -439,12 +613,18 @@ fn parse_list(lex: &mut Lexer<'_>) -> Block {
 
         let (checkbox, content_text) = parse_list_item_content(&raw);
         let (term_text, desc) = if let Some((term, desc_text)) = content_text.split_once(" :: ") {
-            (term, Some(build_inline_content(desc_text, item_span)))
+            (
+                term,
+                Some(build_inline_content(
+                    desc_text,
+                    sub_span(item_span, &raw, desc_text),
+                )),
+            )
         } else {
             (content_text, None)
         };
 
-        let content = build_inline_content(term_text, item_span);
+        let content = build_inline_content(term_text, sub_span(item_span, &raw, term_text));
 
         flat_items.push(ListItem {
             checkbox,
@@ -598,7 +778,10 @@ fn parse_table_row_content(line: &str, span: Span) -> Vec<InlineContent> {
     let inner = inner.strip_suffix('|').unwrap_or(inner);
     inner
         .split('|')
-        .map(|cell| build_inline_content(cell.trim(), span))
+        .map(|cell| {
+            let cell = cell.trim();
+            build_inline_content(cell, sub_span(span, line, cell))
+        })
         .collect()
 }
 
@@ -780,8 +963,12 @@ fn parse_footnote_def(lex: &mut Lexer<'_>) -> Block {
     skip_newline(lex);
 
     let prefix = format!("[^{label}]: ");
-    let content_text = raw.trim().strip_prefix(&prefix).unwrap_or("");
-    let content = build_inline_content(content_text, span);
+    let content = match raw.trim().strip_prefix(&prefix) {
+        Some(content_text) => {
+            build_inline_content(content_text, sub_span(span, &raw, content_text))
+        }
+        None => InlineContent::empty(),
+    };
 
     Block::FootnoteDefinition(FootnoteDefinition {
         label,
@@ -858,45 +1045,95 @@ fn parse_paragraph(lex: &mut Lexer<'_>) -> Option<Block> {
 // Inline content builder (uses lexer::tokenize_inline)
 // ---------------------------------------------------------------------------
 
-fn build_inline_content(text: &str, span: Span) -> InlineContent {
-    let tokens = lexer::tokenize_inline(text, span);
-    tokens_to_inline_content(&tokens, span)
+/// Span for a subslice `sub` of a line's raw text `raw`, where `outer` is the
+/// span of the full line (`outer.start` = byte offset of `raw[0]` in the
+/// source, `outer.col` = its byte column). `sub` must be a subslice of `raw`.
+fn sub_span(outer: Span, raw: &str, sub: &str) -> Span {
+    let delta = sub.as_ptr() as usize - raw.as_ptr() as usize;
+    debug_assert!(
+        delta + sub.len() <= raw.len(),
+        "sub is not a subslice of raw"
+    );
+    Span::new(
+        outer.start + delta,
+        outer.start + delta + sub.len(),
+        outer.line,
+        outer.col + delta as u32,
+    )
 }
 
-fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned], base_span: Span) -> InlineContent {
+fn build_inline_content(text: &str, span: Span) -> InlineContent {
+    let tokens = lexer::tokenize_inline(text, span);
+    tokens_to_inline_content(&tokens)
+}
+
+/// Build an inline segment for a delimited run (bold/italic/strikethrough).
+/// `open_span` is the opening delimiter's span; the closing delimiter (or, if
+/// unclosed, the last inner token) bounds the segment's end.
+fn delimited_span(open_span: Span, inner: &[crate::tokens::Spanned], close: Option<Span>) -> Span {
+    match close {
+        Some(close_span) => open_span.merge(close_span),
+        None => match inner.last() {
+            Some(last) => open_span.merge(last.span),
+            None => open_span,
+        },
+    }
+}
+
+fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned]) -> InlineContent {
     let mut segments: Vec<InlineSegment> = Vec::new();
     let mut i = 0;
 
+    let mut push = |kind: InlineKind, span: Span| {
+        segments.push(InlineSegment { kind, span });
+    };
+
     while i < tokens.len() {
+        let tok_span = tokens[i].span;
         match &tokens[i].kind {
             Token::Text(t) => {
-                segments.push(InlineSegment::Text(t.clone()));
+                push(InlineKind::Text(t.clone()), tok_span);
                 i += 1;
             }
             Token::InlineCode(c) => {
-                segments.push(InlineSegment::Code(c.clone()));
+                push(InlineKind::Code(c.clone()), tok_span);
                 i += 1;
             }
             Token::BoldDelim => {
                 // Collect inner tokens until matching BoldDelim
                 i += 1;
                 let inner_end = find_matching_delim(&tokens[i..], Token::BoldDelim);
-                let inner = tokens_to_inline_content(&tokens[i..i + inner_end], base_span);
-                segments.push(InlineSegment::Bold(inner));
+                let inner_toks = &tokens[i..i + inner_end];
+                let close = tokens.get(i + inner_end).map(|t| t.span);
+                let inner = tokens_to_inline_content(inner_toks);
+                push(
+                    InlineKind::Bold(inner),
+                    delimited_span(tok_span, inner_toks, close),
+                );
                 i += inner_end + 1; // skip closing delim
             }
             Token::ItalicDelim => {
                 i += 1;
                 let inner_end = find_matching_delim(&tokens[i..], Token::ItalicDelim);
-                let inner = tokens_to_inline_content(&tokens[i..i + inner_end], base_span);
-                segments.push(InlineSegment::Italic(inner));
+                let inner_toks = &tokens[i..i + inner_end];
+                let close = tokens.get(i + inner_end).map(|t| t.span);
+                let inner = tokens_to_inline_content(inner_toks);
+                push(
+                    InlineKind::Italic(inner),
+                    delimited_span(tok_span, inner_toks, close),
+                );
                 i += inner_end + 1;
             }
             Token::StrikethroughDelim => {
                 i += 1;
                 let inner_end = find_matching_delim(&tokens[i..], Token::StrikethroughDelim);
-                let inner = tokens_to_inline_content(&tokens[i..i + inner_end], base_span);
-                segments.push(InlineSegment::Strikethrough(inner));
+                let inner_toks = &tokens[i..i + inner_end];
+                let close = tokens.get(i + inner_end).map(|t| t.span);
+                let inner = tokens_to_inline_content(inner_toks);
+                push(
+                    InlineKind::Strikethrough(inner),
+                    delimited_span(tok_span, inner_toks, close),
+                );
                 i += inner_end + 1;
             }
             Token::Link {
@@ -906,55 +1143,50 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned], base_span: Span) 
                 meta,
             } => {
                 let (link_tags, attrs) = match meta.as_deref() {
-                    Some(m) => parse_metadata(m, base_span),
+                    Some(m) => parse_metadata(m, tok_span),
                     None => (Vec::new(), HashMap::new()),
                 };
-                segments.push(InlineSegment::Link(Link {
-                    text: text.clone(),
-                    url: url.clone(),
-                    title: title.clone(),
-                    tags: link_tags,
-                    attributes: attrs,
-                }));
+                push(
+                    InlineKind::Link(Link {
+                        text: text.clone(),
+                        url: url.clone(),
+                        title: title.clone(),
+                        tags: link_tags,
+                        attributes: attrs,
+                    }),
+                    tok_span,
+                );
                 i += 1;
             }
             Token::FootnoteRef { label } => {
-                segments.push(InlineSegment::FootnoteRef(label.clone()));
+                push(InlineKind::FootnoteRef(label.clone()), tok_span);
+                i += 1;
+            }
+            Token::Cite { key, locator } => {
+                push(
+                    InlineKind::Cite {
+                        key: key.clone(),
+                        locator: locator.clone(),
+                    },
+                    tok_span,
+                );
                 i += 1;
             }
             Token::Tag(kw) => {
-                let arg = if i + 1 < tokens.len() {
-                    if let Token::TagArg(a) = &tokens[i + 1].kind {
-                        i += 1;
-                        Some(a.as_str())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let tag = tags::parse_tag(kw.as_str(), arg, base_span);
-                segments.push(InlineSegment::Tag(tag));
+                let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
+                let tag = tags::parse_tag(kw.as_str(), arg, span);
+                push(InlineKind::Tag(tag), span);
                 i += 1;
             }
             Token::UnknownTag { name } => {
-                let arg = if i + 1 < tokens.len() {
-                    if let Token::TagArg(a) = &tokens[i + 1].kind {
-                        i += 1;
-                        Some(a.as_str())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                let tag = tags::parse_tag(name, arg, base_span);
-                segments.push(InlineSegment::Tag(tag));
+                let (arg, span) = take_tag_arg(tokens, &mut i, tok_span);
+                let tag = tags::parse_tag(name, arg, span);
+                push(InlineKind::Tag(tag), span);
                 i += 1;
             }
             Token::TagArg(a) => {
                 // Stray tag arg without a preceding tag — treat as text
-                segments.push(InlineSegment::Text(a.clone()));
+                push(InlineKind::Text(a.clone()), tok_span);
                 i += 1;
             }
             _ => {
@@ -964,6 +1196,23 @@ fn tokens_to_inline_content(tokens: &[crate::tokens::Spanned], base_span: Span) 
     }
 
     InlineContent { segments }
+}
+
+/// If the token after `*i` is a `TagArg`, consume it and return the argument
+/// text plus the tag span extended to cover the argument.
+fn take_tag_arg<'a>(
+    tokens: &'a [crate::tokens::Spanned],
+    i: &mut usize,
+    tag_span: Span,
+) -> (Option<&'a str>, Span) {
+    if let Some(next) = tokens.get(*i + 1)
+        && let Token::TagArg(a) = &next.kind
+    {
+        *i += 1;
+        (Some(a.as_str()), tag_span.merge(next.span))
+    } else {
+        (None, tag_span)
+    }
 }
 
 fn find_matching_delim(tokens: &[crate::tokens::Spanned], delim: Token) -> usize {
@@ -1118,13 +1367,13 @@ mod tests {
             para.content
                 .segments
                 .iter()
-                .any(|s| matches!(s, InlineSegment::Bold(_)))
+                .any(|s| matches!(s.kind, InlineKind::Bold(_)))
         );
         assert!(
             para.content
                 .segments
                 .iter()
-                .any(|s| matches!(s, InlineSegment::Italic(_)))
+                .any(|s| matches!(s.kind, InlineKind::Italic(_)))
         );
     }
 
@@ -1148,7 +1397,7 @@ mod tests {
             para.content
                 .segments
                 .iter()
-                .any(|s| matches!(s, InlineSegment::Link(_)))
+                .any(|s| matches!(s.kind, InlineKind::Link(_)))
         );
     }
 
@@ -1354,6 +1603,585 @@ mod tests {
         } else {
             panic!("expected nested list for parent two");
         }
+    }
+
+    /// Helper: the first paragraph of a parsed document.
+    fn first_paragraph(result: &ParseResult) -> &Paragraph {
+        result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::Paragraph(p) => Some(p),
+                _ => None,
+            })
+            .expect("document should contain a paragraph")
+    }
+
+    fn slice<'a>(src: &'a str, span: &Span) -> &'a str {
+        &src[span.start..span.end]
+    }
+
+    #[test]
+    fn test_inline_spans_slice_source() {
+        // Fixture with bold, inline code, a link, and a #tag on one line.
+        let src = "Intro **bold** with `code` and [click](https://example.com) plus #todo fix it\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let segs = &para.content.segments;
+
+        type KindCheck = fn(&InlineKind) -> bool;
+        let expected: &[(&str, KindCheck)] = &[
+            ("Intro ", |k| matches!(k, InlineKind::Text(_))),
+            ("**bold**", |k| matches!(k, InlineKind::Bold(_))),
+            (" with ", |k| matches!(k, InlineKind::Text(_))),
+            ("`code`", |k| matches!(k, InlineKind::Code(_))),
+            (" and ", |k| matches!(k, InlineKind::Text(_))),
+            ("[click](https://example.com)", |k| {
+                matches!(k, InlineKind::Link(_))
+            }),
+            (" plus ", |k| matches!(k, InlineKind::Text(_))),
+            ("#todo fix it", |k| matches!(k, InlineKind::Tag(_))),
+        ];
+
+        assert_eq!(segs.len(), expected.len(), "segments: {segs:#?}");
+        for (seg, (text, kind_ok)) in segs.iter().zip(expected) {
+            assert!(kind_ok(&seg.kind), "unexpected kind for {text:?}: {seg:#?}");
+            assert_eq!(slice(src, &seg.span), *text);
+            assert_eq!(seg.span.line, 1);
+            // Byte column is 1-based: start offset on line 1 is col - 1.
+            assert_eq!(seg.span.col as usize, seg.span.start + 1);
+        }
+
+        // Inner segment of the bold run points at "bold" itself.
+        if let InlineKind::Bold(inner) = &segs[1].kind {
+            assert_eq!(slice(src, &inner.segments[0].span), "bold");
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn test_inline_spans_multibyte_and_offset_lines() {
+        // Heading + blank line push the paragraph to line 3; "café" has a
+        // two-byte 'é' so byte offsets and byte columns diverge from chars.
+        let src = "# Título\n\ncafé **gras** et `α` fin\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        // Heading content span slices to the text after "# ".
+        let heading = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::Heading(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(slice(src, &heading.content.segments[0].span), "Título");
+        assert_eq!(heading.content.segments[0].span.line, 1);
+        assert_eq!(heading.content.segments[0].span.col, 3);
+
+        let para = first_paragraph(&result);
+        let segs = &para.content.segments;
+        assert_eq!(slice(src, &segs[0].span), "café ");
+        assert_eq!(slice(src, &segs[1].span), "**gras**");
+        assert_eq!(slice(src, &segs[2].span), " et ");
+        assert_eq!(slice(src, &segs[3].span), "`α`");
+        assert_eq!(slice(src, &segs[4].span), " fin");
+        for seg in segs {
+            assert_eq!(seg.span.line, 3);
+        }
+        // "café " is 6 bytes, so the bold run starts at byte column 7.
+        assert_eq!(segs[1].span.col, 7);
+        assert!(matches!(&segs[0].kind, InlineKind::Text(t) if t == "café "));
+    }
+
+    #[test]
+    fn test_inline_spans_multiline_paragraph() {
+        let src = "first line\nsecond **b** line\n";
+        let result = parse_document(src);
+        let para = first_paragraph(&result);
+
+        let bold = para
+            .content
+            .segments
+            .iter()
+            .find(|s| matches!(s.kind, InlineKind::Bold(_)))
+            .unwrap();
+        assert_eq!(slice(src, &bold.span), "**b**");
+        assert_eq!(bold.span.line, 2);
+        assert_eq!(bold.span.col, 8);
+    }
+
+    #[test]
+    fn test_inline_spans_list_item_and_footnote_ref() {
+        let src = "- [ ] task with `code` and [^1]\n";
+        let result = parse_document(src);
+        let list = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::List(l) => Some(l),
+                _ => None,
+            })
+            .unwrap();
+
+        let segs = &list.items[0].content.segments;
+        assert_eq!(slice(src, &segs[0].span), "task with ");
+        assert_eq!(slice(src, &segs[1].span), "`code`");
+        assert_eq!(slice(src, &segs[3].span), "[^1]");
+        assert!(matches!(segs[3].kind, InlineKind::FootnoteRef(_)));
+    }
+
+    #[test]
+    fn test_cite_segment_in_paragraph() {
+        let src = "Evidence from [@paszke_pytorch_2019] and [@martin_adapting_2021-1, p. 4].\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let cites: Vec<_> = para
+            .content
+            .segments
+            .iter()
+            .filter(|s| matches!(s.kind, InlineKind::Cite { .. }))
+            .collect();
+        assert_eq!(cites.len(), 2, "segments: {:#?}", para.content.segments);
+
+        assert!(matches!(
+            &cites[0].kind,
+            InlineKind::Cite { key, locator: None } if key == "paszke_pytorch_2019"
+        ));
+        assert_eq!(slice(src, &cites[0].span), "[@paszke_pytorch_2019]");
+
+        assert!(matches!(
+            &cites[1].kind,
+            InlineKind::Cite { key, locator: Some(loc) }
+                if key == "martin_adapting_2021-1" && loc == "p. 4"
+        ));
+        assert_eq!(
+            slice(src, &cites[1].span),
+            "[@martin_adapting_2021-1, p. 4]"
+        );
+    }
+
+    #[test]
+    fn test_cite_segment_multibyte_spans() {
+        // Multi-byte text around the cite; the paragraph sits on line 3.
+        let src = "# Título\n\ncafé [@key_2020, § 2–3] après\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let cite = para
+            .content
+            .segments
+            .iter()
+            .find(|s| matches!(s.kind, InlineKind::Cite { .. }))
+            .expect("should have a cite segment");
+        assert_eq!(slice(src, &cite.span), "[@key_2020, § 2–3]");
+        assert_eq!(cite.span.line, 3);
+        // "café " is 6 bytes, so the cite starts at byte column 7.
+        assert_eq!(cite.span.col, 7);
+        assert!(matches!(
+            &cite.kind,
+            InlineKind::Cite { key, locator: Some(loc) } if key == "key_2020" && loc == "§ 2–3"
+        ));
+    }
+
+    #[test]
+    fn test_cite_plain_text_fallbacks_parse_as_text() {
+        let src = "bad [@] and [@unclosed\n";
+        let result = parse_document(src);
+        let para = first_paragraph(&result);
+        assert!(
+            para.content
+                .segments
+                .iter()
+                .all(|s| !matches!(s.kind, InlineKind::Cite { .. })),
+            "no cite expected: {:#?}",
+            para.content.segments
+        );
+        assert_eq!(para.content.plain_text(), "bad [@] and [@unclosed");
+    }
+
+    #[test]
+    fn test_frontmatter_entry_spans_slice_source() {
+        let src = "---\ntitle: Test note\ntags:\n  - alpha\n  - beta\ncount: 3\n---\n\nBody.\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        assert_eq!(
+            fm.raw,
+            "title: Test note\ntags:\n  - alpha\n  - beta\ncount: 3"
+        );
+
+        let keys: Vec<&str> = fm.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["title", "tags", "count"]);
+
+        let title = fm.entry("title").unwrap();
+        assert_eq!(slice(src, &title.key_span), "title");
+        assert_eq!(slice(src, &title.value_span), "Test note");
+        assert_eq!(title.key_span.line, 2);
+        assert_eq!(title.key_span.col, 1);
+
+        let tags = fm.entry("tags").unwrap();
+        assert_eq!(slice(src, &tags.key_span), "tags");
+        assert_eq!(slice(src, &tags.value_span), "- alpha\n  - beta");
+        assert_eq!(tags.key_span.line, 3);
+
+        let count = fm.entry("count").unwrap();
+        assert_eq!(slice(src, &count.key_span), "count");
+        assert_eq!(slice(src, &count.value_span), "3");
+        assert_eq!(count.key_span.line, 6);
+
+        // The typed data is still a plain value tree.
+        assert_eq!(
+            fm.data.as_mapping_get("title").and_then(|v| v.as_str()),
+            Some("Test note")
+        );
+        assert_eq!(
+            fm.data.as_mapping_get("count").and_then(|v| v.as_integer()),
+            Some(3)
+        );
+        assert_eq!(
+            fm.data
+                .as_mapping_get("tags")
+                .and_then(|v| v.as_sequence())
+                .map(|s| s.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_frontmatter_entry_spans_multibyte() {
+        // Multi-byte chars in keys and values: saphyr markers are
+        // char-indexed, so byte-exact slicing exercises the conversion.
+        let src = "---\ntítulo: Café crème\nétiquettes:\n  - détail\nn: 1\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+
+        let titulo = fm.entry("título").unwrap();
+        assert_eq!(slice(src, &titulo.key_span), "título");
+        assert_eq!(slice(src, &titulo.value_span), "Café crème");
+        assert_eq!(titulo.key_span.line, 2);
+        assert_eq!(titulo.key_span.col, 1);
+
+        let etiquettes = fm.entry("étiquettes").unwrap();
+        assert_eq!(slice(src, &etiquettes.key_span), "étiquettes");
+        assert_eq!(slice(src, &etiquettes.value_span), "- détail");
+        assert_eq!(etiquettes.key_span.line, 3);
+
+        let n = fm.entry("n").unwrap();
+        assert_eq!(slice(src, &n.key_span), "n");
+        assert_eq!(slice(src, &n.value_span), "1");
+        assert_eq!(n.key_span.line, 5);
+    }
+
+    #[test]
+    fn test_frontmatter_quoted_and_empty_values() {
+        let src = "---\nquoted: \"hello world\"\nempty:\n---\nBody.\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+
+        let quoted = fm.entry("quoted").unwrap();
+        // The value span covers the source markup, quotes included.
+        assert_eq!(slice(src, &quoted.value_span), "\"hello world\"");
+        assert_eq!(
+            fm.data.as_mapping_get("quoted").and_then(|v| v.as_str()),
+            Some("hello world")
+        );
+
+        let empty = fm.entry("empty").unwrap();
+        assert_eq!(slice(src, &empty.key_span), "empty");
+        assert_eq!(slice(src, &empty.value_span), "");
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_relations_shape() {
+        // Block sequence of flow mappings — the `relations:` doc pattern.
+        let src = "---\nrelations:\n  - { to: squares, stance: supports, op: analyze }\n  - { to: circles#c2, stance: opposes }\n---\nBody.\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let relations = fm.entry("relations").unwrap();
+        // The flat span and the node span are the same thing.
+        assert_eq!(relations.value.span, relations.value_span);
+
+        let items = relations.value.items().expect("relations is a sequence");
+        assert_eq!(items.len(), 2);
+
+        // Item spans cover the flow mapping's source markup, braces included.
+        assert_eq!(
+            slice(src, &items[0].span),
+            "{ to: squares, stance: supports, op: analyze }"
+        );
+        assert_eq!(items[0].span.line, 3);
+        assert_eq!(
+            slice(src, &items[1].span),
+            "{ to: circles#c2, stance: opposes }"
+        );
+        assert_eq!(items[1].span.line, 4);
+
+        // Each inner key/value pair slices the source exactly.
+        let FrontmatterNodeKind::Map(pairs) = &items[0].kind else {
+            panic!("expected a mapping, got {:?}", items[0].kind);
+        };
+        let expected = [("to", "squares"), ("stance", "supports"), ("op", "analyze")];
+        assert_eq!(pairs.len(), expected.len());
+        for (pair, (key, value)) in pairs.iter().zip(expected) {
+            assert_eq!(pair.key, key);
+            assert_eq!(slice(src, &pair.key_span), key);
+            assert_eq!(slice(src, &pair.value.span), value);
+            assert!(matches!(pair.value.kind, FrontmatterNodeKind::Scalar));
+        }
+
+        let to = items[1].entry("to").unwrap();
+        assert_eq!(slice(src, &to.key_span), "to");
+        assert_eq!(slice(src, &to.value.span), "circles#c2");
+        let stance = items[1].entry("stance").unwrap();
+        assert_eq!(slice(src, &stance.value.span), "opposes");
+        assert!(items[1].entry("op").is_none());
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_block_sequence_items() {
+        let src = "---\naliases:\n  - first alias\n  - \"quoted one\"\n  - last\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let items = fm.entry("aliases").unwrap().value.items().unwrap();
+        assert_eq!(items.len(), 3);
+        // Item spans cover the item text (markup included), not the `- `.
+        assert_eq!(slice(src, &items[0].span), "first alias");
+        assert_eq!(items[0].span.line, 3);
+        assert_eq!(items[0].span.col, 5);
+        assert_eq!(slice(src, &items[1].span), "\"quoted one\"");
+        assert_eq!(slice(src, &items[2].span), "last");
+        assert_eq!(items[2].span.line, 5);
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_multibyte() {
+        // Multi-byte content in nested values: markers are char-indexed,
+        // byte-exact slicing exercises the conversion at every depth.
+        let src = "---\nrelations:\n  - { à: café crème, cible: carrés }\nétiquettes: [détail, plus—loin]\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let items = fm.entry("relations").unwrap().value.items().unwrap();
+        assert_eq!(
+            slice(src, &items[0].span),
+            "{ à: café crème, cible: carrés }"
+        );
+        let a = items[0].entry("à").unwrap();
+        assert_eq!(slice(src, &a.key_span), "à");
+        assert_eq!(slice(src, &a.value.span), "café crème");
+        let cible = items[0].entry("cible").unwrap();
+        assert_eq!(slice(src, &cible.value.span), "carrés");
+
+        // Flow sequence with multi-byte scalars.
+        let etiquettes = fm.entry("étiquettes").unwrap();
+        assert_eq!(slice(src, &etiquettes.value.span), "[détail, plus—loin]");
+        let tags = etiquettes.value.items().unwrap();
+        assert_eq!(slice(src, &tags[0].span), "détail");
+        assert_eq!(slice(src, &tags[1].span), "plus—loin");
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_deep_nesting() {
+        let src =
+            "---\nouter:\n  middle:\n    - inner: [1, 2]\n      other:\n        deep: yes\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let outer = &fm.entry("outer").unwrap().value;
+        assert_eq!(
+            slice(src, &outer.span),
+            "middle:\n    - inner: [1, 2]\n      other:\n        deep: yes"
+        );
+
+        let middle = outer.entry("middle").unwrap();
+        assert_eq!(slice(src, &middle.key_span), "middle");
+        let items = middle.value.items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            slice(src, &items[0].span),
+            "inner: [1, 2]\n      other:\n        deep: yes"
+        );
+
+        let inner = items[0].entry("inner").unwrap();
+        assert_eq!(slice(src, &inner.value.span), "[1, 2]");
+        let nums = inner.value.items().unwrap();
+        assert_eq!(slice(src, &nums[0].span), "1");
+        assert_eq!(slice(src, &nums[1].span), "2");
+
+        let deep = items[0]
+            .entry("other")
+            .unwrap()
+            .value
+            .entry("deep")
+            .unwrap();
+        assert_eq!(slice(src, &deep.key_span), "deep");
+        assert_eq!(slice(src, &deep.value.span), "yes");
+        assert_eq!(deep.value.span.line, 6);
+        assert_eq!(deep.value.span.col, 15);
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_empty_and_edge_values() {
+        let src =
+            "---\nscalar: plain\nempty:\nmap:\n  present: 1\n  absent:\nseq: []\nflow: {}\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+
+        // A scalar entry is a Scalar leaf whose node span equals value_span.
+        let scalar = fm.entry("scalar").unwrap();
+        assert!(matches!(scalar.value.kind, FrontmatterNodeKind::Scalar));
+        assert_eq!(scalar.value.span, scalar.value_span);
+        assert!(scalar.value.items().is_none());
+        assert!(scalar.value.entry("anything").is_none());
+
+        // An empty top-level value is an empty-span Scalar.
+        let empty = fm.entry("empty").unwrap();
+        assert!(matches!(empty.value.kind, FrontmatterNodeKind::Scalar));
+        assert_eq!(slice(src, &empty.value.span), "");
+
+        // An empty nested mapping value too.
+        let absent = fm.entry("map").unwrap().value.entry("absent").unwrap();
+        assert_eq!(slice(src, &absent.key_span), "absent");
+        assert!(matches!(absent.value.kind, FrontmatterNodeKind::Scalar));
+        assert_eq!(slice(src, &absent.value.span), "");
+
+        // Empty flow collections keep their kind with no children.
+        let seq = fm.entry("seq").unwrap();
+        assert_eq!(seq.value.items(), Some(&[][..]));
+        assert_eq!(slice(src, &seq.value.span), "[]");
+        let flow = fm.entry("flow").unwrap();
+        assert!(matches!(&flow.value.kind, FrontmatterNodeKind::Map(m) if m.is_empty()));
+        assert_eq!(slice(src, &flow.value.span), "{}");
+    }
+
+    #[test]
+    fn test_frontmatter_empty_and_invalid() {
+        // Empty frontmatter parses to a null value with no entries.
+        let result = parse_document("---\n---\nBody.\n");
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        assert!(fm.raw.is_empty());
+        assert!(fm.entries.is_empty());
+        assert!(fm.data.is_null());
+
+        // Invalid YAML is reported and drops the frontmatter, as before.
+        let result = parse_document("---\na: [unclosed\n---\nBody.\n");
+        assert!(result.document.frontmatter.is_none());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| matches!(e.kind, ParseErrorKind::InvalidYaml))
+        );
+    }
+
+    #[test]
+    fn test_anchor_trailing_on_blocks() {
+        // Trailing #anchor on a heading, a paragraph, and a list item.
+        let src = "# Methods #anchor methods\n\nA cited claim. #anchor claim-1\n\n- evidence item #anchor ev_2021-1\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let anchor_name = |content: &InlineContent| -> Option<String> {
+            content.tags().iter().find_map(|t| match &t.kind {
+                TagKind::Anchor { name } => Some(name.clone()),
+                _ => None,
+            })
+        };
+
+        let heading = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::Heading(h) => Some(h),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(anchor_name(&heading.content).as_deref(), Some("methods"));
+
+        let para = first_paragraph(&result);
+        assert_eq!(anchor_name(&para.content).as_deref(), Some("claim-1"));
+
+        let list = result
+            .document
+            .children
+            .iter()
+            .find_map(|b| match b {
+                Block::List(l) => Some(l),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            anchor_name(&list.items[0].content).as_deref(),
+            Some("ev_2021-1")
+        );
+    }
+
+    #[test]
+    fn test_anchor_span_slices_source() {
+        // Multi-byte text before the anchor; the tag segment span (name +
+        // argument) must slice the source exactly. Paragraph is on line 3.
+        let src = "# Título\n\ncafé claim #anchor sec-1\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let para = first_paragraph(&result);
+        let seg = para
+            .content
+            .segments
+            .iter()
+            .find(|s| matches!(s.kind, InlineKind::Tag(_)))
+            .expect("should have a tag segment");
+        assert_eq!(slice(src, &seg.span), "#anchor sec-1");
+        assert_eq!(seg.span.line, 3);
+        // "café claim " is 12 bytes, so the tag starts at byte column 13.
+        assert_eq!(seg.span.col, 13);
+        if let InlineKind::Tag(tag) = &seg.kind {
+            assert!(matches!(&tag.kind, TagKind::Anchor { name } if name == "sec-1"));
+            assert_eq!(slice(src, &tag.span), "#anchor sec-1");
+        } else {
+            unreachable!();
+        }
+    }
+
+    #[test]
+    fn test_anchor_block_tag() {
+        // An #anchor line on its own parses as a block tag.
+        let src = "#anchor standalone-1\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty());
+        assert!(result.document.children.iter().any(|b| matches!(
+            b,
+            Block::BlockTag(Tag {
+                kind: TagKind::Anchor { name },
+                ..
+            }) if name == "standalone-1"
+        )));
     }
 
     #[test]

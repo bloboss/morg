@@ -344,16 +344,86 @@ fn classify_line(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
 /// Tokenize inline content from raw text. Called by the parser when it needs
 /// to break a text line into inline segments (bold, italic, tags, links, etc.).
-pub fn tokenize_inline(text: &str, span: Span) -> Vec<Spanned> {
+///
+/// `base` describes where `text` sits in the original source file:
+/// `base.start` must be the absolute byte offset of `text`'s first byte, and
+/// `base.line`/`base.col` the (1-based) line and byte column of that byte.
+/// Every returned token then carries a span whose `start`/`end` are absolute
+/// byte offsets into the source file and whose `line`/`col` locate the
+/// token's first byte (newlines inside `text` are tracked, so multi-line
+/// paragraphs get per-line positions).
+pub fn tokenize_inline(text: &str, base: Span) -> Vec<Spanned> {
     let mut out = Vec::new();
-    tokenize_inline_into(text, span, &mut out);
+    tokenize_inline_into(text, base, &mut out);
     out
 }
 
-fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
+/// Incrementally maps byte indices within a text fragment to spans that are
+/// absolute within the original source file. Indices must be visited in
+/// non-decreasing order (tokens are emitted left to right).
+struct SpanTracker<'t> {
+    text: &'t [u8],
+    base: Span,
+    /// Byte index in `text` that `line`/`col` currently describe.
+    scanned: usize,
+    line: u32,
+    col: u32,
+}
+
+impl<'t> SpanTracker<'t> {
+    fn new(text: &'t str, base: Span) -> Self {
+        Self {
+            text: text.as_bytes(),
+            base,
+            scanned: 0,
+            line: base.line,
+            col: base.col,
+        }
+    }
+
+    /// Span for `text[start..end]`, with absolute byte offsets and the
+    /// line/col of `start`.
+    fn span(&mut self, start: usize, end: usize) -> Span {
+        while self.scanned < start {
+            if self.text[self.scanned] == b'\n' {
+                self.line += 1;
+                self.col = 1;
+            } else {
+                self.col += 1;
+            }
+            self.scanned += 1;
+        }
+        Span::new(
+            self.base.start + start,
+            self.base.start + end,
+            self.line,
+            self.col,
+        )
+    }
+}
+
+fn tokenize_inline_into(text: &str, base: Span, out: &mut Vec<Spanned>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     let mut current_text = String::new();
+    // Byte index in `text` where the pending text run began.
+    let mut run_start = 0usize;
+    let mut tracker = SpanTracker::new(text, base);
+
+    fn flush(
+        buf: &mut String,
+        run_start: usize,
+        run_end: usize,
+        tracker: &mut SpanTracker<'_>,
+        out: &mut Vec<Spanned>,
+    ) {
+        if !buf.is_empty() {
+            out.push(Spanned {
+                kind: Token::Text(std::mem::take(buf)),
+                span: tracker.span(run_start, run_end),
+            });
+        }
+    }
 
     while i < bytes.len() {
         let ch = bytes[i];
@@ -362,9 +432,15 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
         if ch == b'\\' && i + 1 < bytes.len() {
             let next = bytes[i + 1];
             if next == b'#' || next == b'[' || next == b'*' || next == b'~' || next == b'`' {
+                if current_text.is_empty() {
+                    run_start = i;
+                }
                 current_text.push(next as char);
                 i += 2;
                 continue;
+            }
+            if current_text.is_empty() {
+                run_start = i;
             }
             current_text.push('\\');
             i += 1;
@@ -375,10 +451,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
         if ch == b'`'
             && let Some((code, end)) = scan_backtick_code(text, i)
         {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::InlineCode(code.to_string()),
-                span,
+                span: tracker.span(i, end),
             });
             i = end;
             continue;
@@ -386,10 +462,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
         // Bold **
         if ch == b'*' && peek(bytes, i + 1) == Some(b'*') {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::BoldDelim,
-                span,
+                span: tracker.span(i, i + 2),
             });
             i += 2;
             continue;
@@ -397,10 +473,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
         // Strikethrough ~~
         if ch == b'~' && peek(bytes, i + 1) == Some(b'~') {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::StrikethroughDelim,
-                span,
+                span: tracker.span(i, i + 2),
             });
             i += 2;
             continue;
@@ -408,10 +484,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
         // Italic * (not **)
         if ch == b'*' && peek(bytes, i + 1) != Some(b'*') {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::ItalicDelim,
-                span,
+                span: tracker.span(i, i + 1),
             });
             i += 1;
             continue;
@@ -422,10 +498,24 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
             && peek(bytes, i + 1) == Some(b'^')
             && let Some((label, end)) = try_footnote_ref(text, i)
         {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: Token::FootnoteRef { label },
-                span,
+                span: tracker.span(i, end),
+            });
+            i = end;
+            continue;
+        }
+
+        // Citation [@key] or [@key, locator]
+        if ch == b'['
+            && peek(bytes, i + 1) == Some(b'@')
+            && let Some((key, locator, end)) = try_cite(text, i)
+        {
+            flush(&mut current_text, run_start, i, &mut tracker, out);
+            out.push(Spanned {
+                kind: Token::Cite { key, locator },
+                span: tracker.span(i, end),
             });
             i = end;
             continue;
@@ -435,10 +525,10 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
         if ch == b'['
             && let Some((link_tok, end)) = try_link(text, i)
         {
-            flush_text_token(&mut current_text, span, out);
+            flush(&mut current_text, run_start, i, &mut tracker, out);
             out.push(Spanned {
                 kind: link_tok,
-                span,
+                span: tracker.span(i, end),
             });
             i = end;
             continue;
@@ -446,37 +536,42 @@ fn tokenize_inline_into(text: &str, span: Span, out: &mut Vec<Spanned>) {
 
         // Tag
         if ch == b'#' {
-            if let Some(next) = peek(bytes, i + 1)
-                && ((next as char).is_alphanumeric() || next == b'_')
+            if let Some(next) = text[i + 1..].chars().next()
+                && (next.is_alphanumeric() || next == '_')
             {
-                flush_text_token(&mut current_text, span, out);
-                let (tok, arg_tok, end) = tokenize_tag(text, i + 1, span);
-                out.push(Spanned { kind: tok, span });
-                if let Some(at) = arg_tok {
-                    out.push(Spanned { kind: at, span });
+                flush(&mut current_text, run_start, i, &mut tracker, out);
+                let tag = tokenize_tag(text, i + 1);
+                out.push(Spanned {
+                    kind: tag.token,
+                    span: tracker.span(i, tag.name_end),
+                });
+                if let Some((arg_tok, arg_start, arg_end)) = tag.arg {
+                    out.push(Spanned {
+                        kind: arg_tok,
+                        span: tracker.span(arg_start, arg_end),
+                    });
                 }
-                i = end;
+                i = tag.end;
                 continue;
+            }
+            if current_text.is_empty() {
+                run_start = i;
             }
             current_text.push('#');
             i += 1;
             continue;
         }
 
-        current_text.push(ch as char);
-        i += 1;
+        // Plain character — push the whole (possibly multi-byte) char.
+        if current_text.is_empty() {
+            run_start = i;
+        }
+        let c = text[i..].chars().next().unwrap();
+        current_text.push(c);
+        i += c.len_utf8();
     }
 
-    flush_text_token(&mut current_text, span, out);
-}
-
-fn flush_text_token(buf: &mut String, span: Span, out: &mut Vec<Spanned>) {
-    if !buf.is_empty() {
-        out.push(Spanned {
-            kind: Token::Text(std::mem::take(buf)),
-            span,
-        });
-    }
+    flush(&mut current_text, run_start, i, &mut tracker, out);
 }
 
 // ===========================================================================
@@ -640,6 +735,59 @@ fn try_footnote_ref(text: &str, start: usize) -> Option<(String, usize)> {
     Some((label.to_string(), start + 2 + end + 1))
 }
 
+/// Scan a Pandoc-style citation `[@key]` / `[@key, locator]` whose `[` sits
+/// at byte `start`. Returns the key, the optional locator (trimmed, `None`
+/// when empty), and the byte index just past the closing `]`.
+///
+/// Returns `None` — so the caller falls through to link parsing or plain
+/// text — when the key is empty or malformed, the bracket never closes on
+/// this inline run, unexpected content follows the key, or the citation is
+/// immediately followed by `(` (link syntax `[text](url)` takes precedence).
+fn try_cite(text: &str, start: usize) -> Option<(String, Option<String>, usize)> {
+    let bytes = text.as_bytes();
+    if bytes.get(start) != Some(&b'[') || bytes.get(start + 1) != Some(&b'@') {
+        return None;
+    }
+
+    // Key: ASCII alphanumerics plus `_`, with `-` allowed after the first
+    // char (trailing disambiguation suffixes like `-1`).
+    let key_start = start + 2;
+    let first = *bytes.get(key_start)?;
+    if !first.is_ascii_alphanumeric() && first != b'_' {
+        return None;
+    }
+    let mut pos = key_start + 1;
+    while pos < bytes.len()
+        && (bytes[pos].is_ascii_alphanumeric() || bytes[pos] == b'_' || bytes[pos] == b'-')
+    {
+        pos += 1;
+    }
+    let key_end = pos;
+
+    // Optional locator after a comma; `]` must close on this inline run.
+    let locator = match bytes.get(pos)? {
+        b']' => None,
+        b',' => {
+            let loc_start = pos + 1;
+            let close = text[loc_start..].find(']')? + loc_start;
+            pos = close;
+            let loc = text[loc_start..close].trim();
+            if loc.is_empty() {
+                None
+            } else {
+                Some(loc.to_string())
+            }
+        }
+        _ => return None,
+    };
+
+    let end = pos + 1; // past the `]`
+    if peek(bytes, end) == Some(b'(') {
+        return None; // `[@key](url)` is a link, not a citation
+    }
+    Some((text[key_start..key_end].to_string(), locator, end))
+}
+
 fn try_link(text: &str, start: usize) -> Option<(Token, usize)> {
     let bytes = text.as_bytes();
     if bytes.get(start).copied() != Some(b'[') {
@@ -743,20 +891,34 @@ fn parse_link_paren(inner: &str) -> (String, Option<String>, Option<String>) {
     (url, title, meta)
 }
 
-fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<Token>, usize) {
+/// Result of scanning a `#name [arg]` inline tag.
+struct ScannedTag {
+    /// The tag token itself (`Tag` or `UnknownTag`).
+    token: Token,
+    /// Byte index (in the scanned text) just past the tag name.
+    name_end: usize,
+    /// Optional argument token with the byte range of its trimmed raw text.
+    arg: Option<(Token, usize, usize)>,
+    /// Byte index just past everything consumed by this tag.
+    end: usize,
+}
+
+/// Scan a tag starting at `name_start` (the byte after `#`; the `#` itself is
+/// at `name_start - 1`).
+fn tokenize_tag(text: &str, name_start: usize) -> ScannedTag {
     let bytes = text.as_bytes();
     let mut pos = name_start;
 
-    while pos < bytes.len() {
-        let c = bytes[pos] as char;
+    for c in text[name_start..].chars() {
         if c.is_alphanumeric() || c == '-' || c == '_' {
-            pos += 1;
+            pos += c.len_utf8();
         } else {
             break;
         }
     }
 
-    let name = &text[name_start..pos];
+    let name_end = pos;
+    let name = &text[name_start..name_end];
     let tok = match Keyword::from_str(name) {
         Some(kw) => Token::Tag(kw),
         None => Token::UnknownTag {
@@ -765,13 +927,14 @@ fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<To
     };
 
     let mut arg = String::new();
-    if pos < bytes.len() && bytes[pos] == b' ' {
+    let arg_scan_start = if pos < bytes.len() && bytes[pos] == b' ' {
         pos += 1;
+        let scan_start = pos;
         while pos < bytes.len() {
             let c = bytes[pos];
             if c == b'#'
-                && let Some(next) = peek(bytes, pos + 1)
-                && ((next as char).is_alphanumeric() || next == b'_')
+                && let Some(next) = text[pos + 1..].chars().next()
+                && (next.is_alphanumeric() || next == '_')
             {
                 break;
             }
@@ -785,21 +948,37 @@ fn tokenize_tag(text: &str, name_start: usize, _span: Span) -> (Token, Option<To
                 pos += 1;
                 continue;
             }
-            arg.push(c as char);
-            pos += 1;
+            let ch = text[pos..].chars().next().unwrap();
+            arg.push(ch);
+            pos += ch.len_utf8();
         }
-    }
+        Some(scan_start)
+    } else {
+        None
+    };
 
     let arg_tok = {
         let trimmed = arg.trim();
         if trimmed.is_empty() {
             None
         } else {
-            Some(Token::TagArg(trimmed.to_string()))
+            // Recover the raw byte range of the trimmed argument: escape
+            // sequences only shift interior bytes, so trimming whitespace on
+            // the raw text matches trimming on the built string.
+            let scan_start = arg_scan_start.unwrap_or(pos);
+            let raw = &text[scan_start..pos];
+            let arg_start = scan_start + (raw.len() - raw.trim_start().len());
+            let arg_end = scan_start + raw.trim_end().len();
+            Some((Token::TagArg(trimmed.to_string()), arg_start, arg_end))
         }
     };
 
-    (tok, arg_tok, pos)
+    ScannedTag {
+        token: tok,
+        name_end,
+        arg: arg_tok,
+        end: pos,
+    }
 }
 
 // ===========================================================================
@@ -912,6 +1091,46 @@ mod tests {
     }
 
     #[test]
+    fn test_inline_tag_multibyte_name() {
+        // Tag names may contain non-ASCII alphanumerics; the scanner must
+        // advance whole chars, never landing inside a multi-byte sequence.
+        let tokens = inline_tokens("note #café fix accents");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "note "));
+        assert!(matches!(&tokens[1], Token::UnknownTag { name } if name == "café"));
+        assert!(matches!(&tokens[2], Token::TagArg(a) if a == "fix accents"));
+
+        let tokens = inline_tokens("#日本語タグ 引数はこちら");
+        assert!(matches!(&tokens[0], Token::UnknownTag { name } if name == "日本語タグ"));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "引数はこちら"));
+    }
+
+    #[test]
+    fn test_inline_tag_multibyte_spans() {
+        // Spans must slice the source exactly even around multi-byte chars.
+        let src = "αβ #todo fíx это";
+        let spanned = tokenize_inline(src, Span::new(0, src.len(), 1, 1));
+        for s in &spanned {
+            match &s.kind {
+                Token::Tag(_) => assert_eq!(&src[s.span.start..s.span.end], "#todo"),
+                Token::TagArg(a) => assert_eq!(&src[s.span.start..s.span.end], a.as_str()),
+                Token::Text(t) => assert_eq!(&src[s.span.start..s.span.end], t.as_str()),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_inline_tag_arg_stops_at_next_multibyte_tag() {
+        // A '#' followed by a multi-byte alphanumeric starts a new tag; the
+        // old byte-cast check misread the first UTF-8 byte here.
+        let tokens = inline_tokens("#todo done #über arg");
+        assert!(matches!(&tokens[0], Token::Tag(Keyword::Todo)));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "done"));
+        assert!(matches!(&tokens[2], Token::UnknownTag { name } if name == "über"));
+        assert!(matches!(&tokens[3], Token::TagArg(a) if a == "arg"));
+    }
+
+    #[test]
     fn test_inline_bold_italic() {
         let tokens = inline_tokens("**bold** and *italic*");
         assert!(matches!(&tokens[0], Token::BoldDelim));
@@ -945,6 +1164,128 @@ mod tests {
         assert!(matches!(&tokens[0], Token::Text(t) if t == "text"));
         assert!(matches!(&tokens[1], Token::FootnoteRef { label } if label == "1"));
         assert!(matches!(&tokens[2], Token::Text(t) if t == " more"));
+    }
+
+    #[test]
+    fn test_block_anchor_tag() {
+        let tokens = block_tokens("#anchor intro-claim");
+        assert!(matches!(&tokens[0], Token::Tag(Keyword::Anchor)));
+        assert!(matches!(&tokens[1], Token::TagArg(a) if a == "intro-claim"));
+    }
+
+    #[test]
+    fn test_inline_trailing_anchor_tag() {
+        let tokens = inline_tokens("the claim text #anchor claim-1");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "the claim text "));
+        assert!(matches!(&tokens[1], Token::Tag(Keyword::Anchor)));
+        assert!(matches!(&tokens[2], Token::TagArg(a) if a == "claim-1"));
+    }
+
+    #[test]
+    fn test_inline_anchor_span_multibyte() {
+        // Multi-byte text before the tag; spans must slice exactly.
+        let src = "résumé claim #anchor sec-1";
+        let spanned = tokenize_inline(src, Span::new(0, src.len(), 1, 1));
+        let tag = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::Tag(Keyword::Anchor)))
+            .expect("should lex an anchor tag");
+        assert_eq!(&src[tag.span.start..tag.span.end], "#anchor");
+        let arg = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::TagArg(_)))
+            .unwrap();
+        assert_eq!(&src[arg.span.start..arg.span.end], "sec-1");
+    }
+
+    #[test]
+    fn test_inline_cite_simple() {
+        let tokens = inline_tokens("see [@paszke_pytorch_2019] for details");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "see "));
+        assert!(matches!(
+            &tokens[1],
+            Token::Cite { key, locator: None } if key == "paszke_pytorch_2019"
+        ));
+        assert!(matches!(&tokens[2], Token::Text(t) if t == " for details"));
+    }
+
+    #[test]
+    fn test_inline_cite_with_locator() {
+        let tokens = inline_tokens("[@martin_adapting_2021-1, p. 4]");
+        assert!(matches!(
+            &tokens[0],
+            Token::Cite { key, locator: Some(loc) }
+                if key == "martin_adapting_2021-1" && loc == "p. 4"
+        ));
+    }
+
+    #[test]
+    fn test_inline_cite_empty_locator_is_none() {
+        let tokens = inline_tokens("[@key, ]");
+        assert!(matches!(
+            &tokens[0],
+            Token::Cite { key, locator: None } if key == "key"
+        ));
+    }
+
+    #[test]
+    fn test_inline_cite_fallback_to_text() {
+        // Empty key
+        let tokens = inline_tokens("[@] nothing");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "[@] nothing"));
+
+        // Unclosed bracket
+        let tokens = inline_tokens("see [@dangling_2020");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "see [@dangling_2020"));
+
+        // Content after the key that is not `,` or `]`
+        let tokens = inline_tokens("[@key extra]");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "[@key extra]"));
+
+        // Unclosed after locator comma
+        let tokens = inline_tokens("[@key, p. 4");
+        assert!(matches!(&tokens[0], Token::Text(t) if t == "[@key, p. 4"));
+    }
+
+    #[test]
+    fn test_inline_cite_not_confused_with_link_or_footnote() {
+        // `[@key](url)` is a link whose text happens to start with @
+        let tokens = inline_tokens("[@key](https://example.com)");
+        assert!(matches!(&tokens[0], Token::Link { text, .. } if text == "@key"));
+
+        // Footnotes keep working
+        let tokens = inline_tokens("x[^1] and [@real_key_2024]");
+        assert!(matches!(&tokens[1], Token::FootnoteRef { label } if label == "1"));
+        assert!(matches!(&tokens[3], Token::Cite { key, .. } if key == "real_key_2024"));
+    }
+
+    #[test]
+    fn test_inline_cite_spans_slice_source_multibyte() {
+        // Multi-byte chars before the cite and inside the locator; slicing
+        // the source with the token span must yield the exact citation text.
+        let src = "αβ [@kohler_2019, p. 4–5] fin";
+        let spanned = tokenize_inline(src, Span::new(0, src.len(), 1, 1));
+        let cite = spanned
+            .iter()
+            .find(|s| matches!(s.kind, Token::Cite { .. }))
+            .expect("should lex a cite");
+        assert_eq!(
+            &src[cite.span.start..cite.span.end],
+            "[@kohler_2019, p. 4–5]"
+        );
+        assert!(matches!(
+            &cite.kind,
+            Token::Cite { key, locator: Some(loc) } if key == "kohler_2019" && loc == "p. 4–5"
+        ));
+    }
+
+    #[test]
+    fn test_inline_cite_non_ascii_key_falls_back() {
+        // 'ö' is outside the key charset (ASCII alphanumerics, `_`, `-`),
+        // so this is not a citation; the whole run stays plain text.
+        let src = "[@köhler_2019] text";
+        let tokens = inline_tokens(src);
+        assert!(matches!(&tokens[0], Token::Text(t) if t == src));
     }
 
     #[test]

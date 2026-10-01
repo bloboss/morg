@@ -6,4 +6,4 @@ version.workspace = true
 [dependencies]
 chrono.workspace = true
 serde.workspace = true
-serde_yaml.workspace = true
+saphyr.workspace = true

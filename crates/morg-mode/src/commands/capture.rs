@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use saphyr::LoadableYamlNode;
+
 pub fn run(template_name: &str, input: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_file_path();
 
@@ -12,27 +14,30 @@ pub fn run(template_name: &str, input: &str) -> Result<(), Box<dyn std::error::E
     }
 
     let config_str = std::fs::read_to_string(&config_path)?;
-    let config: serde_yaml::Value = serde_yaml::from_str(&config_str)?;
+    let config = saphyr::YamlOwned::load_from_str(&config_str)?
+        .into_iter()
+        .next()
+        .ok_or("Capture config is empty")?;
 
     let templates = config
-        .get("templates")
+        .as_mapping_get("templates")
         .ok_or("No 'templates' key in capture config")?;
     let template = templates
-        .get(template_name)
+        .as_mapping_get(template_name)
         .ok_or_else(|| format!("Template '{template_name}' not found in config"))?;
 
     let target_path = template
-        .get("target")
+        .as_mapping_get("target")
         .and_then(|v| v.as_str())
         .ok_or("Template missing 'target' field")?;
     let target_path = expand_home(target_path);
 
     let template_str = template
-        .get("template")
+        .as_mapping_get("template")
         .and_then(|v| v.as_str())
         .ok_or("Template missing 'template' field")?;
 
-    let heading = template.get("heading").and_then(|v| v.as_str());
+    let heading = template.as_mapping_get("heading").and_then(|v| v.as_str());
 
     let now = chrono::Local::now();
     let rendered = template_str

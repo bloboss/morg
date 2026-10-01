@@ -137,7 +137,7 @@ This table tracks which org-mode file-level features morg-mode supports, adapts,
 | Horizontal rules | `-----` | Not yet | |
 | Drawers | `:NAME:...:END:` | Partial | Property drawers via `#properties`...`#end` |
 | Archiving | `:ARCHIVE:` tag | Not yet | |
-| Citations | `[cite:@key]` | Not yet | |
+| Citations | `[cite:@key]` | Supported | `[@key]`, `[@key, p. 4]` (pandoc-style) |
 
 ## Morg-Unique Features
 
@@ -145,5 +145,6 @@ This table tracks which org-mode file-level features morg-mode supports, adapts,
 |---|---|---|
 | `#tag` inline system | `#todo`, `#deadline`, etc. | Tags anywhere in text, not position-dependent |
 | Callout metadata | `> [!type][#tangle file=x]` | Tangleable callouts |
+| Block anchors | `#anchor intro-claim` | Stable block addresses (`id#name`), trailing or standalone |
 | YAML frontmatter merge | `morg frontmatter` | Aggregate structured metadata |
 | Escaped hash | `\#` | Literal `#` in text |

@@ -8,7 +8,9 @@ morg-mode extends standard markdown with a `#tag` system for metadata, time trac
 
 ## Features
 
-- **Tag system** -- `#todo`, `#deadline`, `#scheduled`, `#clock`, `#priority`, `#effort`, `#archive`, `#media`, and more. Tags are inline (`text #todo fix this`) or block-level (`#deadline 2026-04-10`).
+- **Tag system** -- `#todo`, `#deadline`, `#scheduled`, `#clock`, `#priority`, `#effort`, `#archive`, `#media`, `#anchor`, and more. Tags are inline (`text #todo fix this`) or block-level (`#deadline 2026-04-10`). Tag names are Unicode-aware.
+- **Citations** -- Pandoc-style `[@key]` and `[@key, p. 4]` inline citations, parsed into typed segments and preserved in HTML export.
+- **Anchors** -- `#anchor name` gives blocks stable addresses (`id#name`), trailing on headings, paragraphs, and list items or standalone.
 - **Code tangling** -- Extract tagged code blocks into standalone files with `#tangle file=path`. Supports noweb references (`<<block-name>>`), indent preservation, and recursive expansion.
 - **Time tracking** -- `#clock-in`/`#clock-out` pairs and `#clock 1h30m` durations, aggregated into per-heading reports.
 - **Todo management** -- `#todo`/`#done` tags, checkbox lists, custom workflow sequences, priorities, and effort estimates. Aggregated across files.
@@ -152,7 +154,7 @@ morg-mode/
       tokens.rs          # define_keywords! macro (single source of truth)
       lexer.rs           # Block tokenizer + inline tokenizer
       parser.rs          # Token-consuming recursive descent
-      ast.rs             # 12 Block variants, 8 InlineSegment variants
+      ast.rs             # 12 Block variants, 9 InlineSegment variants
       tags.rs            # Strongly-typed TagKind enum
     morg-mode/           # CLI binary (18 commands)
       config.rs          # TOML configuration

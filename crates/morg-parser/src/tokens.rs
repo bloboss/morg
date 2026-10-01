@@ -79,6 +79,9 @@ define_keywords! {
     // Media tracking
     Media       => "media",
 
+    // Addressing
+    Anchor      => "anchor",
+
     // Structure
     Properties  => "properties",
     End         => "end",
@@ -167,6 +170,11 @@ pub enum Token {
     },
     /// `[^label]` footnote reference
     FootnoteRef { label: String },
+    /// `[@key]` or `[@key, locator]` Pandoc-style citation
+    Cite {
+        key: String,
+        locator: Option<String>,
+    },
     /// `key=value` attribute
     Attribute { key: String, value: String },
     /// Tag argument text (after a tag, before the next tag)

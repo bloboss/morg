@@ -185,7 +185,7 @@ fn lint_inline_content(
 
     // Check for broken links (empty URL)
     for seg in &content.segments {
-        if let InlineSegment::Link(link) = seg
+        if let InlineKind::Link(link) = &seg.kind
             && link.url.is_empty()
             && link.text.is_empty()
         {

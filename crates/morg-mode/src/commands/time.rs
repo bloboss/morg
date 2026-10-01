@@ -121,7 +121,7 @@ pub fn run(paths: &[PathBuf], project: Option<&str>) -> Result<(), Box<dyn std::
     println!("{}", "=".repeat(40));
 
     let mut headings: Vec<_> = per_heading.into_iter().collect();
-    headings.sort_by(|a, b| b.1.cmp(&a.1));
+    headings.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     for (heading, mins) in &headings {
         let label = if heading.is_empty() {

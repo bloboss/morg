@@ -2,7 +2,7 @@
 
 ## Tags
 
-All morg-mode metadata uses `#tag` syntax. A `#` followed immediately by an alphanumeric character (no space) is a tag. `# ` with a space is a heading.
+All morg-mode metadata uses `#tag` syntax. A `#` followed immediately by an alphanumeric character (no space) is a tag. `# ` with a space is a heading. Alphanumeric is Unicode-aware: names like `#café` or `#予定` are tags too, both block-level and inline.
 
 ### Block-level tags
 
@@ -109,6 +109,53 @@ cables
 3 purchase(s), total $74.47
 ```
 
+## Anchors
+
+The `#anchor` tag gives a block a stable, user-chosen name so it can be
+addressed as `id#name` (document id plus anchor name) no matter where it
+moves. It works anywhere other tags do -- trailing on a heading, paragraph,
+or list item, or on its own line as a block-level tag:
+
+```
+## Methods #anchor methods
+
+The key claim of the paper. #anchor claim-1
+
+- supporting evidence #anchor ev_2021-1
+
+#anchor standalone-note
+```
+
+Anchor names are slugs: ASCII letters and digits plus `-` and `_`, starting
+with a letter or digit. Anything else (empty, whitespace, non-ASCII) is not
+a valid name -- the tag falls back to an unknown tag in the parser's usual
+lenient style.
+
+## Citations
+
+Pandoc-style citations reference a bibliography key inline, with an
+optional locator after a comma:
+
+```
+The gradient flows end to end [@paszke_pytorch_2019].
+A narrower claim [@kohler_2019, p. 4].
+```
+
+- **key** -- starts right after `[@`: ASCII letters, digits, and `_`, with
+  `-` also allowed after the first character (`real_key-1`).
+- **locator** -- free text between the comma and the closing `]`, trimmed,
+  e.g. `p. 4`, `pp. 10-12`, `ch. 2`. An empty locator (`[@key, ]`) is
+  treated as absent.
+
+Parsing is lenient: an empty or non-ASCII key, a bracket that never closes
+on the line, or unexpected content after the key is left as plain text
+rather than an error. Link syntax keeps precedence -- `[@key](url)` parses
+as a link, not a citation.
+
+HTML export renders a citation verbatim inside
+`<span class="cite" data-cite-key="key">`, so output stays lossless until
+bibliography resolution exists.
+
 ## Code Blocks
 
 Standard markdown fences with tags and attributes on the info string:
@@ -138,6 +185,12 @@ title: My Document
 tags: [rust, morg]
 ---
 ```
+
+Frontmatter is parsed with [saphyr](https://docs.rs/saphyr), which preserves
+source positions; the raw text between the delimiters is kept verbatim.
+`morg frontmatter` aggregates and merges frontmatter across files -- merged
+output is standard YAML, with sequence items indented and strings containing
+commas double-quoted.
 
 ## Tables
 

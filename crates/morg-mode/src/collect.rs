@@ -91,23 +91,20 @@ pub fn file_tags(document: &Document) -> Vec<String> {
     let Some(ref fm) = document.frontmatter else {
         return Vec::new();
     };
-    match &fm.data {
-        serde_yaml::Value::Mapping(map) => {
-            let key = serde_yaml::Value::String("tags".to_string());
-            match map.get(&key) {
-                Some(serde_yaml::Value::Sequence(seq)) => seq
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect(),
-                Some(serde_yaml::Value::String(s)) => s
-                    .split(',')
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect(),
-                _ => Vec::new(),
-            }
-        }
-        _ => Vec::new(),
+    let Some(tags) = fm.data.as_mapping_get("tags") else {
+        return Vec::new();
+    };
+    if let Some(seq) = tags.as_sequence() {
+        seq.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    } else if let Some(s) = tags.as_str() {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    } else {
+        Vec::new()
     }
 }
 
@@ -123,20 +120,17 @@ pub fn todo_sequences(document: &Document) -> Vec<TodoSequence> {
     let Some(ref fm) = document.frontmatter else {
         return Vec::new();
     };
-    let serde_yaml::Value::Mapping(map) = &fm.data else {
-        return Vec::new();
-    };
-
-    let key = serde_yaml::Value::String("todo_sequences".to_string());
-    let Some(serde_yaml::Value::Sequence(seqs)) = map.get(&key) else {
+    let Some(seqs) = fm
+        .data
+        .as_mapping_get("todo_sequences")
+        .and_then(|v| v.as_sequence())
+    else {
         return Vec::new();
     };
 
     seqs.iter()
         .filter_map(|seq| {
-            let serde_yaml::Value::Sequence(items) = seq else {
-                return None;
-            };
+            let items = seq.as_sequence()?;
             let mut states = Vec::new();
             let mut past_separator = false;
             for item in items {
