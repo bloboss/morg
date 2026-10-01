@@ -102,6 +102,7 @@ Tags are prefixed with `#` (no space -- a space after `#` makes it a heading). E
 | `morg time` | Time tracking report |
 | `morg search` | Full-text and tag search |
 | `morg tags` | Tabulate a custom tag declared in `[tags]` config |
+| `morg emit-grammar` | Render tree-sitter-morg's generated region from `[tags]` |
 | `morg lint` | Validate documents |
 | `morg export` | Markdown to HTML |
 | `morg ical` | Export to iCalendar |
@@ -134,6 +135,11 @@ carry_todos = true
 
 [capture]
 templates_file = "~/.config/morg/capture.yaml"
+
+# Where `morg emit-grammar` finds tree-sitter-morg's grammar.js
+# (overridden by --grammar-dir)
+[grammar]
+dir = "~/Code/Software/Morog/tree-sitter-morg"
 ```
 
 ## Neovim Plugin
