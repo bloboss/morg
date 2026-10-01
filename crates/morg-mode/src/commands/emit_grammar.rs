@@ -159,7 +159,7 @@ fn render_region(shaped: &[(String, ArgShape)]) -> String {
 }
 
 /// One `inline_tag_<name>` rule: the literal `#name` token (aliased to
-/// tag_name) followed by an optional argument — the shape's token when it
+/// tag_name) followed by an optional argument — the shape's branch when it
 /// matches, the generic greedy tag_argument otherwise.
 fn render_rule(name: &str, shape: ArgShape) -> String {
     let mut s = String::new();
@@ -168,28 +168,53 @@ fn render_rule(name: &str, shape: ArgShape) -> String {
     s.push_str("    prec.right(\n      seq(\n        field(\"name\", alias(token(\"#");
     s.push_str(name);
     s.push_str(
-        "\"), $.tag_name)),\n        optional(\n          field(\n            \"argument\",\n            choice(\n              alias(token(prec(2, /",
+        "\"), $.tag_name)),\n        optional(\n          field(\n            \"argument\",\n            choice(\n              ",
     );
-    s.push_str(shape_token_regex(shape));
+    s.push_str(&shape_branch(shape));
     s.push_str(
-        "/)), $.tag_argument),\n              $.tag_argument,\n            ),\n          ),\n        ),\n      ),\n    ),\n",
+        ",\n              $.tag_argument,\n            ),\n          ),\n        ),\n      ),\n    ),\n",
     );
     s
 }
 
-/// The tree-sitter token regex for a shape's argument. Divergences from the
-/// Rust lexer (documented in tree-sitter-morg's README): `word` and unquoted
-/// `kv` values stop at any `#` (the Rust lexer only stops at a `#` that
-/// starts a tag), and `until-punct` keeps interior trailing spaces out via
-/// its final character class rather than trimming.
+/// The grammar branch for a shape's argument, aliased to tag_argument.
+///
+/// Every shape except `kv` is a single token. `kv` must not be: a token
+/// regex `pair([ \t]+pair)*` shares its space transition out of the
+/// accepting pair state with the greedy tag_argument token's DFA path, so
+/// when the trailing repetition fails mid-way (`a=1 rest`) the lexer has
+/// already walked past the prec-2 accept and settles on the longer prec-0
+/// greedy match. One token per pair with a syntactic repeat1 keeps each
+/// accept final, and inline whitespace between pairs is handled by extras.
+fn shape_branch(shape: ArgShape) -> String {
+    match shape {
+        ArgShape::Kv => {
+            format!("alias(prec.right(repeat1(token(prec(2, /{KV_PAIR_REGEX}/)))), $.tag_argument)")
+        }
+        _ => format!(
+            "alias(token(prec(2, /{}/)), $.tag_argument)",
+            shape_token_regex(shape)
+        ),
+    }
+}
+
+/// One `key=value` pair: tag-name-charset key, quoted or unquoted value (an
+/// unquoted value never starts with `"`, mirroring the Rust lexer's
+/// quoted-first scan).
+const KV_PAIR_REGEX: &str = r#"[\p{L}\p{N}_-]+=("(\\[^\r\n]|[^"\\\r\n])*"|[^\s#"][^\s#]*)"#;
+
+/// The tree-sitter token regex for a single-token shape. Divergences from
+/// the Rust lexer (documented in tree-sitter-morg's README): `word` and
+/// unquoted `kv` values stop at any `#` (the Rust lexer only stops at a `#`
+/// that starts a tag), `quoted` keeps its quotes and escapes in the node
+/// text (the Rust lexer unescapes), and `until-punct` keeps interior
+/// trailing spaces out via its final character class rather than trimming.
 fn shape_token_regex(shape: ArgShape) -> &'static str {
     match shape {
         ArgShape::Greedy => unreachable!("greedy tags stay on the default rule"),
+        ArgShape::Kv => unreachable!("kv renders as a repeat1 of pair tokens"),
         ArgShape::Quoted => r#""(\\[^\r\n]|[^"\\\r\n])*""#,
         ArgShape::Word => r"[^\s#]+",
-        ArgShape::Kv => {
-            r#"[\p{L}\p{N}_-]+=("(\\[^\r\n]|[^"\\\r\n])*"|[^\s#]+)([ \t]+[\p{L}\p{N}_-]+=("(\\[^\r\n]|[^"\\\r\n])*"|[^\s#]+))*"#
-        }
         ArgShape::UntilPunct => r"[^.,;:!?\s]([^.,;:!?\r\n]*[^.,;:!?\s])?",
     }
 }
