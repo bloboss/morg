@@ -42,6 +42,67 @@ pub struct FrontmatterEntry {
     pub key: String,
     pub key_span: Span,
     pub value_span: Span,
+    /// Span-annotated view of the value, recursing into sequences and
+    /// mappings. `value.span == value_span` always; the nesting is what
+    /// this adds.
+    pub value: FrontmatterNode,
+}
+
+/// A YAML value inside the frontmatter together with its source location,
+/// recursing into sequence items and mapping entries.
+///
+/// `span` follows the same convention as [`FrontmatterEntry::value_span`]:
+/// absolute byte offsets covering the value's source markup (quotes, block
+/// markers, flow braces/brackets included), trailing whitespace trimmed, so
+/// `&source[node.span.start..node.span.end]` slices the node's source text
+/// exactly. An empty value yields an empty span just past its position.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrontmatterNode {
+    pub span: Span,
+    pub kind: FrontmatterNodeKind,
+}
+
+impl FrontmatterNode {
+    /// Sequence items, if this node is a sequence.
+    pub fn items(&self) -> Option<&[FrontmatterNode]> {
+        match &self.kind {
+            FrontmatterNodeKind::Seq(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// The mapping entry for `key`, if this node is a mapping containing it.
+    pub fn entry(&self, key: &str) -> Option<&FrontmatterMapEntry> {
+        match &self.kind {
+            FrontmatterNodeKind::Map(entries) => entries.iter().find(|e| e.key == key),
+            _ => None,
+        }
+    }
+}
+
+/// The shape of a [`FrontmatterNode`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrontmatterNodeKind {
+    /// A scalar (or alias/other leaf); the value text is `span`'s slice.
+    Scalar,
+    /// A sequence, block (`- a`) or flow (`[a, b]`), one node per item in
+    /// document order.
+    Seq(Vec<FrontmatterNode>),
+    /// A mapping, block or flow (`{a: 1}`), entries in document order.
+    /// Entries with non-string keys are skipped, as in
+    /// [`Frontmatter::entries`].
+    Map(Vec<FrontmatterMapEntry>),
+}
+
+/// One `key: value` pair of a nested frontmatter mapping.
+///
+/// `key_span` covers the key text; both spans follow the
+/// [`FrontmatterNode`] conventions.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrontmatterMapEntry {
+    pub key: String,
+    pub key_span: Span,
+    pub value: FrontmatterNode,
 }
 
 #[derive(Debug, Clone, PartialEq)]

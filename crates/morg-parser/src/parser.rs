@@ -125,49 +125,125 @@ fn load_frontmatter_yaml(
     }
     let marked = docs.remove(0);
 
-    // Char index (saphyr markers) → byte offset in `raw`.
-    let char_to_byte: Vec<usize> = raw
-        .char_indices()
-        .map(|(b, _)| b)
-        .chain(std::iter::once(raw.len()))
-        .collect();
-    let to_byte =
-        |char_idx: usize| -> usize { char_to_byte.get(char_idx).copied().unwrap_or(raw.len()) };
-    let abs_span = |start_b: usize, end_b: usize| -> Span {
-        let prefix = &raw[..start_b];
-        let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
-        Span::new(
-            base_offset + start_b,
-            base_offset + end_b,
-            base_line + prefix.matches('\n').count() as u32,
-            (start_b - line_start) as u32 + 1,
-        )
+    let cx = YamlSpanCx {
+        raw,
+        // Char index (saphyr markers) → byte offset in `raw`.
+        char_to_byte: raw
+            .char_indices()
+            .map(|(b, _)| b)
+            .chain(std::iter::once(raw.len()))
+            .collect(),
+        base_offset,
+        base_line,
     };
 
     let mut entries = Vec::new();
     if let YamlDataOwned::Mapping(map) = &marked.data {
         for (k, v) in map {
-            let Some(key) = k.data.as_str() else {
+            let Some((key, key_span)) = cx.key(k) else {
                 continue; // non-string key — no typed entry for it
             };
-            let key_span = abs_span(to_byte(k.span.start.index()), to_byte(k.span.end.index()));
-
-            // The value's end marker may extend past the value text (e.g.
-            // over the newline after a block sequence); trim it back.
-            let v_start = to_byte(v.span.start.index());
-            let v_end = to_byte(v.span.end.index()).max(v_start);
-            let v_end = v_start + raw[v_start..v_end].trim_end().len();
-            let value_span = abs_span(v_start, v_end);
+            let value = cx.node(v);
 
             entries.push(FrontmatterEntry {
-                key: key.to_string(),
+                key,
                 key_span,
-                value_span,
+                value_span: value.span,
+                value,
             });
         }
     }
 
     Ok((marked_to_plain(marked), entries))
+}
+
+/// Maps saphyr's char-indexed markers on `raw` back to [`Span`]s with
+/// absolute byte offsets into the document source.
+struct YamlSpanCx<'a> {
+    raw: &'a str,
+    char_to_byte: Vec<usize>,
+    /// Absolute byte offset of `raw`'s first byte in the source.
+    base_offset: usize,
+    /// 1-based line of `raw`'s first line in the source.
+    base_line: u32,
+}
+
+impl YamlSpanCx<'_> {
+    fn to_byte(&self, char_idx: usize) -> usize {
+        self.char_to_byte
+            .get(char_idx)
+            .copied()
+            .unwrap_or(self.raw.len())
+    }
+
+    fn abs_span(&self, start_b: usize, end_b: usize) -> Span {
+        let prefix = &self.raw[..start_b];
+        let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        Span::new(
+            self.base_offset + start_b,
+            self.base_offset + end_b,
+            self.base_line + prefix.matches('\n').count() as u32,
+            (start_b - line_start) as u32 + 1,
+        )
+    }
+
+    /// The string key and its span, or `None` for a non-string key.
+    fn key(&self, k: &saphyr::MarkedYamlOwned) -> Option<(String, Span)> {
+        let key = k.data.as_str()?;
+        let span = self.abs_span(
+            self.to_byte(k.span.start.index()),
+            self.to_byte(k.span.end.index()),
+        );
+        Some((key.to_string(), span))
+    }
+
+    /// Build the span-annotated node tree for a marked YAML value.
+    fn node(&self, v: &saphyr::MarkedYamlOwned) -> FrontmatterNode {
+        use saphyr::YamlDataOwned;
+
+        // The value's end marker may extend past the value text (e.g.
+        // over the newline after a block sequence); trim it back.
+        let start = self.to_byte(v.span.start.index());
+        let mut end = self.to_byte(v.span.end.index()).max(start);
+        // For flow collections the end marker instead points AT the closing
+        // delimiter, leaving it outside the exclusive range; take it back in
+        // so the span covers the full `[...]`/`{...}` markup.
+        for (open, close, is_kind) in [
+            ('[', ']', matches!(v.data, YamlDataOwned::Sequence(_))),
+            ('{', '}', matches!(v.data, YamlDataOwned::Mapping(_))),
+        ] {
+            if is_kind && self.raw[start..].starts_with(open) && self.raw[end..].starts_with(close)
+            {
+                end += close.len_utf8();
+            }
+        }
+        let end = start + self.raw[start..end].trim_end().len();
+        let span = self.abs_span(start, end);
+
+        let kind = match &v.data {
+            YamlDataOwned::Sequence(items) => {
+                FrontmatterNodeKind::Seq(items.iter().map(|item| self.node(item)).collect())
+            }
+            YamlDataOwned::Mapping(map) => FrontmatterNodeKind::Map(
+                map.iter()
+                    .filter_map(|(k, inner)| {
+                        let (key, key_span) = self.key(k)?;
+                        Some(FrontmatterMapEntry {
+                            key,
+                            key_span,
+                            value: self.node(inner),
+                        })
+                    })
+                    .collect(),
+            ),
+            // A tagged node keeps the outer span (tag markup included) but
+            // takes its shape from the inner value.
+            YamlDataOwned::Tagged(_, inner) => self.node(inner).kind,
+            _ => FrontmatterNodeKind::Scalar,
+        };
+
+        FrontmatterNode { span, kind }
+    }
 }
 
 /// Strip span annotations from a `MarkedYamlOwned` tree, yielding the plain
@@ -1829,6 +1905,177 @@ mod tests {
         let empty = fm.entry("empty").unwrap();
         assert_eq!(slice(src, &empty.key_span), "empty");
         assert_eq!(slice(src, &empty.value_span), "");
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_relations_shape() {
+        // Block sequence of flow mappings — the `relations:` doc pattern.
+        let src = "---\nrelations:\n  - { to: squares, stance: supports, op: analyze }\n  - { to: circles#c2, stance: opposes }\n---\nBody.\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let relations = fm.entry("relations").unwrap();
+        // The flat span and the node span are the same thing.
+        assert_eq!(relations.value.span, relations.value_span);
+
+        let items = relations.value.items().expect("relations is a sequence");
+        assert_eq!(items.len(), 2);
+
+        // Item spans cover the flow mapping's source markup, braces included.
+        assert_eq!(
+            slice(src, &items[0].span),
+            "{ to: squares, stance: supports, op: analyze }"
+        );
+        assert_eq!(items[0].span.line, 3);
+        assert_eq!(
+            slice(src, &items[1].span),
+            "{ to: circles#c2, stance: opposes }"
+        );
+        assert_eq!(items[1].span.line, 4);
+
+        // Each inner key/value pair slices the source exactly.
+        let FrontmatterNodeKind::Map(pairs) = &items[0].kind else {
+            panic!("expected a mapping, got {:?}", items[0].kind);
+        };
+        let expected = [("to", "squares"), ("stance", "supports"), ("op", "analyze")];
+        assert_eq!(pairs.len(), expected.len());
+        for (pair, (key, value)) in pairs.iter().zip(expected) {
+            assert_eq!(pair.key, key);
+            assert_eq!(slice(src, &pair.key_span), key);
+            assert_eq!(slice(src, &pair.value.span), value);
+            assert!(matches!(pair.value.kind, FrontmatterNodeKind::Scalar));
+        }
+
+        let to = items[1].entry("to").unwrap();
+        assert_eq!(slice(src, &to.key_span), "to");
+        assert_eq!(slice(src, &to.value.span), "circles#c2");
+        let stance = items[1].entry("stance").unwrap();
+        assert_eq!(slice(src, &stance.value.span), "opposes");
+        assert!(items[1].entry("op").is_none());
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_block_sequence_items() {
+        let src = "---\naliases:\n  - first alias\n  - \"quoted one\"\n  - last\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let items = fm.entry("aliases").unwrap().value.items().unwrap();
+        assert_eq!(items.len(), 3);
+        // Item spans cover the item text (markup included), not the `- `.
+        assert_eq!(slice(src, &items[0].span), "first alias");
+        assert_eq!(items[0].span.line, 3);
+        assert_eq!(items[0].span.col, 5);
+        assert_eq!(slice(src, &items[1].span), "\"quoted one\"");
+        assert_eq!(slice(src, &items[2].span), "last");
+        assert_eq!(items[2].span.line, 5);
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_multibyte() {
+        // Multi-byte content in nested values: markers are char-indexed,
+        // byte-exact slicing exercises the conversion at every depth.
+        let src = "---\nrelations:\n  - { à: café crème, cible: carrés }\nétiquettes: [détail, plus—loin]\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let items = fm.entry("relations").unwrap().value.items().unwrap();
+        assert_eq!(
+            slice(src, &items[0].span),
+            "{ à: café crème, cible: carrés }"
+        );
+        let a = items[0].entry("à").unwrap();
+        assert_eq!(slice(src, &a.key_span), "à");
+        assert_eq!(slice(src, &a.value.span), "café crème");
+        let cible = items[0].entry("cible").unwrap();
+        assert_eq!(slice(src, &cible.value.span), "carrés");
+
+        // Flow sequence with multi-byte scalars.
+        let etiquettes = fm.entry("étiquettes").unwrap();
+        assert_eq!(slice(src, &etiquettes.value.span), "[détail, plus—loin]");
+        let tags = etiquettes.value.items().unwrap();
+        assert_eq!(slice(src, &tags[0].span), "détail");
+        assert_eq!(slice(src, &tags[1].span), "plus—loin");
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_deep_nesting() {
+        let src =
+            "---\nouter:\n  middle:\n    - inner: [1, 2]\n      other:\n        deep: yes\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+        let outer = &fm.entry("outer").unwrap().value;
+        assert_eq!(
+            slice(src, &outer.span),
+            "middle:\n    - inner: [1, 2]\n      other:\n        deep: yes"
+        );
+
+        let middle = outer.entry("middle").unwrap();
+        assert_eq!(slice(src, &middle.key_span), "middle");
+        let items = middle.value.items().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            slice(src, &items[0].span),
+            "inner: [1, 2]\n      other:\n        deep: yes"
+        );
+
+        let inner = items[0].entry("inner").unwrap();
+        assert_eq!(slice(src, &inner.value.span), "[1, 2]");
+        let nums = inner.value.items().unwrap();
+        assert_eq!(slice(src, &nums[0].span), "1");
+        assert_eq!(slice(src, &nums[1].span), "2");
+
+        let deep = items[0]
+            .entry("other")
+            .unwrap()
+            .value
+            .entry("deep")
+            .unwrap();
+        assert_eq!(slice(src, &deep.key_span), "deep");
+        assert_eq!(slice(src, &deep.value.span), "yes");
+        assert_eq!(deep.value.span.line, 6);
+        assert_eq!(deep.value.span.col, 15);
+    }
+
+    #[test]
+    fn test_frontmatter_nested_nodes_empty_and_edge_values() {
+        let src =
+            "---\nscalar: plain\nempty:\nmap:\n  present: 1\n  absent:\nseq: []\nflow: {}\n---\n";
+        let result = parse_document(src);
+        assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+
+        let fm = result.document.frontmatter.as_ref().unwrap();
+
+        // A scalar entry is a Scalar leaf whose node span equals value_span.
+        let scalar = fm.entry("scalar").unwrap();
+        assert!(matches!(scalar.value.kind, FrontmatterNodeKind::Scalar));
+        assert_eq!(scalar.value.span, scalar.value_span);
+        assert!(scalar.value.items().is_none());
+        assert!(scalar.value.entry("anything").is_none());
+
+        // An empty top-level value is an empty-span Scalar.
+        let empty = fm.entry("empty").unwrap();
+        assert!(matches!(empty.value.kind, FrontmatterNodeKind::Scalar));
+        assert_eq!(slice(src, &empty.value.span), "");
+
+        // An empty nested mapping value too.
+        let absent = fm.entry("map").unwrap().value.entry("absent").unwrap();
+        assert_eq!(slice(src, &absent.key_span), "absent");
+        assert!(matches!(absent.value.kind, FrontmatterNodeKind::Scalar));
+        assert_eq!(slice(src, &absent.value.span), "");
+
+        // Empty flow collections keep their kind with no children.
+        let seq = fm.entry("seq").unwrap();
+        assert_eq!(seq.value.items(), Some(&[][..]));
+        assert_eq!(slice(src, &seq.value.span), "[]");
+        let flow = fm.entry("flow").unwrap();
+        assert!(matches!(&flow.value.kind, FrontmatterNodeKind::Map(m) if m.is_empty()));
+        assert_eq!(slice(src, &flow.value.span), "{}");
     }
 
     #[test]
