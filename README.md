@@ -114,6 +114,7 @@ Tags are prefixed with `#` (no space -- a space after `#` makes it a heading). E
 | `morg id` | Assign UUIDs to headings |
 | `morg watch` | File watcher for auto-tangle |
 | `morg frontmatter` | Aggregate YAML frontmatter |
+| `morg completions` | Shell completion script (zsh, bash, fish, ...) to stdout |
 
 All commands accept `--format json` for machine-readable output. When no files are specified, commands default to the `root` directory from config.
 

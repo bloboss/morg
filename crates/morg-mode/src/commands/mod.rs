@@ -2,6 +2,7 @@ pub mod agenda;
 pub mod archive;
 pub mod capture;
 pub mod columns;
+pub mod completions;
 pub mod diary;
 pub mod emit_grammar;
 pub mod export;

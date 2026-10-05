@@ -12,3 +12,4 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 saphyr = "0.1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
