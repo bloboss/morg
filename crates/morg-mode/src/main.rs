@@ -100,6 +100,7 @@ fn main() {
             suffix,
             dry_run,
         } => commands::archive::run(&default_files(files), &suffix, dry_run),
+        Command::Completions { shell } => commands::completions::run(shell),
         Command::Watch {
             files,
             command,

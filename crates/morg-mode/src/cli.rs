@@ -173,6 +173,11 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Generate a shell completion script and write it to stdout
+    Completions {
+        /// Shell to generate completions for (zsh, bash, fish, ...)
+        shell: clap_complete::Shell,
+    },
     /// Watch files and re-run a command on changes
     Watch {
         /// Markdown files or directories to watch
