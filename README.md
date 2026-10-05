@@ -37,6 +37,13 @@ cargo install --path crates/morg-mode
 
 This installs the `morg` binary to `~/.cargo/bin/`.
 
+### Arch Linux
+
+`packaging/PKGBUILD` builds a `morg-git` package from the latest commit:
+`cd packaging && makepkg -si`. It installs the binary plus generated
+zsh/bash/fish completions system-wide under `/usr/share` (unlike the
+cargo-install path above, which leaves completions to the user).
+
 ### Initialize config
 
 ```sh
